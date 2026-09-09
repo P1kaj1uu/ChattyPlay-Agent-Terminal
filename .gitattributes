@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+# Windows launch scripts use their native line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never apply text conversion to binary assets or local indexes.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.sqlite binary
+*.sqlite3 binary

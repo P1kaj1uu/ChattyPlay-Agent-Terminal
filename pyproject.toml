@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chattyplay-agent"
+version = "0.8.0"
+description = "Local, cross-platform terminal AI coding agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "ChattyPlay"}]
+dependencies = [
+  "prompt-toolkit>=3.0.48,<4",
+  "langchain-ollama>=1.0,<2",
+]
+
+[project.scripts]
+chattyplay = "chattyplay.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["chattyplay*"]

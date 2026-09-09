@@ -1,0 +1,35 @@
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and packages
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Local settings and secrets
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+
+# ChattyPlay runtime data (project Skills remain versioned)
+.chattyplay/config.json
+.chattyplay/sessions/
+.chattyplay/exports/
+.chattyplay/prompt_history
+.chattyplay/rag.sqlite3
+.chattyplay/rag.sqlite3-*
+.chattyplay/*.tmp
