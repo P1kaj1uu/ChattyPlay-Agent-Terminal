@@ -265,8 +265,10 @@ class CoreTests(unittest.TestCase):
         agent = Agent(self.root, config)
         try:
             agent.messages = [
-                {"role": "user", "content": "old" * 500},
-                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "original goal"},
+                {"role": "assistant", "content": "starting"},
+                {"role": "user", "content": "middle" * 500},
+                {"role": "assistant", "content": "middle answer"},
                 {"role": "user", "content": "new"},
                 {"role": "assistant", "content": None, "tool_calls": [{"id": "x", "function": {"name": "read_file", "arguments": "{}"}}]},
                 {"role": "tool", "tool_call_id": "x", "content": "result"},
@@ -274,6 +276,40 @@ class CoreTests(unittest.TestCase):
             active = agent.context_messages()
             self.assertEqual(active[0]["content"], "new")
             self.assertEqual(active[-1]["role"], "tool")
+            self.assertLessEqual(len(json.dumps(active, ensure_ascii=False)), 1000)
+            self.assertNotIn("original goal", [message.get("content") for message in active])
+            self.assertNotIn("middle" * 500, [message.get("content") for message in active])
+        finally:
+            agent.close()
+
+    def test_context_does_not_truncate_oversized_current_turn(self) -> None:
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["agent"]["max_context_chars"] = 1000
+        agent = Agent(self.root, config)
+        try:
+            agent.messages = [{"role": "user", "content": "x" * 2000}]
+            self.assertEqual(agent.context_messages(), agent.messages)
+        finally:
+            agent.close()
+
+    def test_agent_sends_previous_turn_with_follow_up(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.requests: list[list[dict]] = []
+
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+                self.requests.append(messages)
+                return {"role": "assistant", "content": "first answer" if len(self.requests) == 1 else "second answer"}
+
+        agent = Agent(self.root, ConfigStore(self.root, self.root / "user.json").load())
+        fake = FakeClient()
+        agent.client = fake
+        try:
+            agent.run("first question")
+            agent.run("follow up")
+            history = fake.requests[1][1:]
+            self.assertEqual([message["content"] for message in history], ["first question", "first answer", "follow up"])
+            self.assertEqual(SessionStore(self.root).load(agent.session_id), agent.messages)
         finally:
             agent.close()
 
