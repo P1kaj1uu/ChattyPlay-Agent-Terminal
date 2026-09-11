@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import sys
 import threading
+import time
 from itertools import cycle
 from pathlib import Path
 from typing import Callable, TextIO
@@ -13,7 +14,7 @@ from prompt_toolkit.utils import get_cwidth
 COMMANDS = [
     "/help", "/new", "/resume", "/fork", "/compact", "/export", "/model", "/provider", "/thinking",
     "/plan", "/skills", "/mcp", "/context", "/stats", "/undo", "/copy", "/doctor", "/config",
-    "/init", "/reload", "/run", "/ollama", "/rag", "/web", "/exit",
+    "/init", "/reload", "/run", "/ollama", "/rag", "/wiki", "/web", "/exit",
 ]
 
 CHATTYPLAY_ART = (
@@ -43,7 +44,7 @@ def welcome_screen(
     reset: str = "",
 ) -> str:
     """Build a responsive startup card without taking over the terminal."""
-    columns = max(32, min(width or shutil.get_terminal_size((100, 24)).columns, 120))
+    columns = max(20, min(width or shutil.get_terminal_size((100, 24)).columns, 120))
     inner = columns - 2
 
     def fit(value: str, size: int) -> str:
@@ -70,6 +71,7 @@ def welcome_screen(
         "/help  commands",
         "/web   visual settings",
         "/run   shell command",
+        "/thinking off  faster replies",
         "/doctor environment check",
         "",
         "Model",
@@ -110,6 +112,7 @@ class Spinner:
         self.enabled = self.stream.isatty()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._rendered_width = 0
 
     def start(self) -> None:
         if not self.enabled or (self._thread and self._thread.is_alive()):
@@ -124,14 +127,18 @@ class Spinner:
         self._stop.set()
         self._thread.join()
         self._thread = None
-        self.stream.write("\r" + " " * (len(self.text) + 2) + "\r")
+        self.stream.write("\r" + " " * self._rendered_width + "\r")
         self.stream.flush()
 
     def _spin(self) -> None:
+        started = time.monotonic()
         for symbol in cycle("|/-\\"):
             if self._stop.is_set():
                 return
-            self.stream.write(f"\r{self.style}{symbol} {self.text}{self.reset}")
+            elapsed = int(time.monotonic() - started)
+            label = self.text if elapsed < 2 else f"{self.text} {elapsed}s · Ctrl+C to cancel"
+            self._rendered_width = max(self._rendered_width, get_cwidth(label) + 2)
+            self.stream.write(f"\r{self.style}{symbol} {label}{self.reset}")
             self.stream.flush()
             if self._stop.wait(0.1):
                 return

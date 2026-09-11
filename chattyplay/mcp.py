@@ -117,9 +117,11 @@ class MCPManager:
                     safe_tool = re.sub(r"\W+", "_", original)
                     local_name = f"mcp__{safe_server}__{safe_tool}"
                     schema = remote.get("inputSchema") or {"type": "object", "properties": {}}
+                    def call(args: dict[str, Any], client: MCPClient = client, tool_name: str = original) -> dict[str, Any]:
+                        return client.call_tool(tool_name, args)
                     registry.add(Tool(
                         local_name, str(remote.get("description", f"MCP tool {original}")), schema, "mcp",
-                        lambda args, c=client, n=original: c.call_tool(n, args),
+                        call,
                     ))
                 self.status[server_name] = f"connected ({len(remote_tools)} tools)"
             except Exception as exc:

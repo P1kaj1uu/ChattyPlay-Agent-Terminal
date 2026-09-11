@@ -6,6 +6,7 @@ import re
 import urllib.error
 import urllib.request
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 
 class ModelError(RuntimeError):
@@ -37,8 +38,11 @@ class OpenAIClient:
             payload["tool_choice"] = "auto"
         if self.provider.get("temperature") is not None:
             payload["temperature"] = float(self.provider["temperature"])
-        if self.provider.get("thinking_enabled"):
-            payload["thinking"] = {"type": "enabled"}
+        parsed_url = urlparse(str(self.provider["base_url"]))
+        local_ollama = parsed_url.hostname in {"127.0.0.1", "localhost", "::1"} and parsed_url.port == 11434
+        if self.provider.get("reasoning_effort") == "none" or (local_ollama and not self.provider.get("thinking_enabled")):
+            payload["reasoning_effort"] = "none"
+        elif self.provider.get("thinking_enabled"):
             payload["reasoning_effort"] = str(self.provider.get("reasoning_effort", "medium"))
         url = self.provider["base_url"].rstrip("/") + "/chat/completions"
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}

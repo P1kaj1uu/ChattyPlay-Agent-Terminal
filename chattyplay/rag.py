@@ -15,7 +15,24 @@ TEXT_SUFFIXES = {
     ".jsx", ".kt", ".md", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".swift", ".toml", ".ts",
     ".tsx", ".txt", ".vue", ".xml", ".yaml", ".yml",
 }
-EXCLUDED = {".git", ".chattyplay", ".venv", "build", "dist", "node_modules", "vendor"}
+EXCLUDED = {
+    ".git", ".chattyplay", ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox", ".venv",
+    "__pycache__", "build", "coverage", "dist", "node_modules", "vendor",
+}
+
+
+def source_files(workspace: Path) -> Iterable[Path]:
+    workspace = workspace.resolve()
+    for path in workspace.rglob("*"):
+        try:
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+                continue
+            parts = path.relative_to(workspace).parts
+            if any(part in EXCLUDED or part.endswith(".egg-info") for part in parts) or path.stat().st_size > 1_000_000:
+                continue
+            yield path
+        except OSError:
+            continue
 
 
 class RAGIndex:
@@ -42,12 +59,7 @@ class RAGIndex:
         return self._custom_embed([text])[0] if self._custom_embed else self._langchain().embed_query(text)
 
     def _files(self) -> Iterable[Path]:
-        for path in self.workspace.rglob("*"):
-            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
-                continue
-            if any(part in EXCLUDED for part in path.relative_to(self.workspace).parts) or path.stat().st_size > 1_000_000:
-                continue
-            yield path
+        return source_files(self.workspace)
 
     def _chunks(self, paths: Iterable[Path]) -> list[tuple[str, int, str]]:
         size = int(self.config.get("chunk_lines", 80))

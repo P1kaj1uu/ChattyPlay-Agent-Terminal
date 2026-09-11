@@ -50,7 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chunk_lines": 80,
         "overlap_lines": 10,
     },
-    "agent": {"max_steps": 30, "max_tool_output": 30000, "max_context_chars": 500000, "max_file_mention_chars": 30000, "max_image_bytes": 5000000, "max_images": 4},
+    "agent": {"max_steps": 30, "max_tool_output": 30000, "max_context_chars": 120000, "max_file_mention_chars": 30000, "max_image_bytes": 5000000, "max_images": 4},
 }
 
 
@@ -80,7 +80,9 @@ class ConfigStore:
     def __init__(self, workspace: Path | str = ".", user_path: Path | None = None):
         self.workspace = Path(workspace).resolve()
         self.user_path = user_path or Path.home() / ".chattyplay" / "config.json"
-        self.project_path = self.workspace / ".chattyplay" / "config.json"
+        self.project_path = (self.workspace / ".chattyplay" / "config.json").resolve()
+        if not self.project_path.is_relative_to(self.workspace):
+            raise ValueError("Project .chattyplay directory must stay inside the workspace")
         self._write_lock = Lock()
 
     def load(self) -> dict[str, Any]:
@@ -116,12 +118,16 @@ class ConfigStore:
             raise ValueError("provider.api_style must be openai or anthropic")
         if not isinstance(provider.get("thinking_enabled", False), bool):
             raise ValueError("provider.thinking_enabled must be boolean")
-        if provider.get("reasoning_effort", "medium") not in {"low", "medium", "high", "max"}:
-            raise ValueError("provider.reasoning_effort must be low, medium, high, or max")
+        if provider.get("reasoning_effort", "medium") not in {"none", "low", "medium", "high", "max"}:
+            raise ValueError("provider.reasoning_effort must be none, low, medium, high, or max")
         if provider.get("api_style") == "anthropic" and not provider["api_key_env"].strip():
             raise ValueError("Anthropic requires provider.api_key_env")
         if not str(provider["base_url"]).startswith(("http://", "https://")):
             raise ValueError("provider.base_url must be an HTTP(S) URL")
+        if not isinstance(provider.get("max_tokens"), int) or isinstance(provider.get("max_tokens"), bool) or provider["max_tokens"] < 1:
+            raise ValueError("provider.max_tokens must be a positive integer")
+        if provider.get("temperature") is not None and not isinstance(provider["temperature"], (int, float)):
+            raise ValueError("provider.temperature must be a number or null")
         permissions = merged.get("permissions")
         if not isinstance(permissions, dict):
             raise ValueError("permissions must be an object")
@@ -141,13 +147,37 @@ class ConfigStore:
                 raise ValueError(f"providerProfiles.{name} requires base_url and model")
             if not isinstance(resolved.get("api_key_env"), str):
                 raise ValueError(f"providerProfiles.{name}.api_key_env must be a string")
+            if not str(resolved["base_url"]).startswith(("http://", "https://")):
+                raise ValueError(f"providerProfiles.{name}.base_url must be an HTTP(S) URL")
+            if resolved.get("api_style") == "anthropic" and not resolved["api_key_env"].strip():
+                raise ValueError(f"providerProfiles.{name} requires an API key environment variable")
+            if not isinstance(resolved.get("max_tokens"), int) or isinstance(resolved.get("max_tokens"), bool) or resolved["max_tokens"] < 1:
+                raise ValueError(f"providerProfiles.{name}.max_tokens must be a positive integer")
+            if not isinstance(resolved.get("thinking_enabled", False), bool) or resolved.get("reasoning_effort", "medium") not in {"none", "low", "medium", "high", "max"}:
+                raise ValueError(f"providerProfiles.{name} has invalid reasoning settings")
         if not isinstance(merged.get("skills"), dict):
             raise ValueError("skills must be an object")
+        skills = merged["skills"]
+        if any(not isinstance(skills.get(key), list) or any(not isinstance(item, str) for item in skills[key]) for key in ("enabled", "dirs")):
+            raise ValueError("skills.enabled and skills.dirs must be string arrays")
         if not isinstance(merged.get("agent"), dict):
             raise ValueError("agent must be an object")
+        agent = merged["agent"]
+        for key in ("max_steps", "max_tool_output", "max_context_chars", "max_file_mention_chars", "max_image_bytes", "max_images"):
+            if not isinstance(agent.get(key), int) or isinstance(agent.get(key), bool) or agent[key] < 1:
+                raise ValueError(f"agent.{key} must be a positive integer")
         rag = merged.get("rag")
         if not isinstance(rag, dict) or not isinstance(rag.get("enabled"), bool):
             raise ValueError("rag must be an object and rag.enabled must be boolean")
+        if not isinstance(rag.get("base_url"), str) or not rag["base_url"].startswith(("http://", "https://")):
+            raise ValueError("rag.base_url must be an HTTP(S) URL")
+        if not isinstance(rag.get("embedding_model"), str) or not rag["embedding_model"].strip():
+            raise ValueError("rag.embedding_model must be a non-empty string")
+        for key in ("top_k", "chunk_lines", "overlap_lines"):
+            if not isinstance(rag.get(key), int) or isinstance(rag.get(key), bool) or rag[key] < (0 if key == "overlap_lines" else 1):
+                raise ValueError(f"rag.{key} is invalid")
+        if rag["overlap_lines"] >= rag["chunk_lines"]:
+            raise ValueError("rag.overlap_lines must be smaller than rag.chunk_lines")
         if not isinstance(rag.get("base_url"), str) or not rag["base_url"].startswith(("http://", "https://")):
             raise ValueError("rag.base_url must be an HTTP(S) URL")
         if not isinstance(rag.get("embedding_model"), str) or not rag["embedding_model"].strip():

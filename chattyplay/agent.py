@@ -14,6 +14,7 @@ from .rag import RAGIndex
 from .sessions import SessionStore
 from .skills import discover, enabled_prompt
 from .tools import Tool, ToolRegistry
+from .wiki import ProjectWiki
 
 
 BASE_PROMPT = """You are ChattyPlay, a local AI coding agent.
@@ -23,12 +24,22 @@ Use tools whenever facts depend on local files or commands. Never invent tool re
 Keep edits inside the workspace. Run the smallest relevant verification after non-trivial edits.
 Do not perform destructive, irreversible, privileged, or externally visible actions without explicit user approval.
 When done, summarize the result and verification concisely.
+When activate_tools is the only available tool, call it before answering any request that needs current workspace facts or actions.
 """
+
+ACTIVATE_TOOLS = {
+    "type": "function",
+    "function": {
+        "name": "activate_tools",
+        "description": "Enable repository inspection, editing, shell, browser, RAG, Wiki, Skills, delegation, and MCP tools. Call before using workspace facts or taking actions; skip for greetings and self-contained questions.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+}
 
 
 def _project_instructions(workspace: Path) -> str:
-    path = workspace / "AGENTS.md"
-    if not path.is_file():
+    path = (workspace / "AGENTS.md").resolve()
+    if not path.is_relative_to(workspace.resolve()) or not path.is_file():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")[:30000]
 
@@ -63,8 +74,30 @@ class Agent:
             max_output=int(agent_config.get("max_tool_output", 30000)),
         )
         self.mcp = MCPManager()
-        self.mcp.connect(config.get("mcpServers", {}), self.registry, self.workspace)
+        mcp_configs = config.get("mcpServers", {})
+        enabled_mcp = [name for name, value in mcp_configs.items() if not isinstance(value, dict) or value.get("disabled") is not True]
+        mcp_policy = self.registry.permissions.get("mcp", "ask")
+        mcp_decision: bool | str = mcp_policy == "allow"
+        if enabled_mcp and mcp_policy == "ask":
+            mcp_decision = self.registry.confirm("mcp", "start servers: " + ", ".join(enabled_mcp)) if self.registry.confirm else False
+            if mcp_decision == "always":
+                self.registry.always_allowed.add("mcp")
+        if mcp_decision:
+            self.mcp.connect(mcp_configs, self.registry, self.workspace)
+        else:
+            self.mcp.status.update({
+                name: "disabled" if isinstance(value, dict) and value.get("disabled") is True else "permission denied"
+                for name, value in mcp_configs.items()
+            })
         self.rag = RAGIndex(self.workspace, config.get("rag", {}))
+        self.wiki = ProjectWiki(self.workspace)
+        self.registry.add(Tool(
+            "read_project_wiki",
+            "Read the LLM-compiled project wiki for architecture, components, workflows, configuration, and known risks. Prefer it for broad project questions; verify exact code with file or RAG tools.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            "read",
+            lambda _: self.wiki.read(),
+        ))
         if config.get("rag", {}).get("enabled", True):
             self.registry.add(Tool(
                 "search_codebase",
@@ -115,6 +148,7 @@ class Agent:
         self.messages.append({"role": "user", "content": content})
         max_steps = min(100, max(1, int(self.config.get("agent", {}).get("max_steps", 30))))
         final = ""
+        tools_active = False
         try:
             for _ in range(max_steps):
                 system = self.system
@@ -123,7 +157,7 @@ class Agent:
                 request_messages = [{"role": "system", "content": system}, *self.context_messages()]
                 if on_status:
                     on_status("thinking")
-                message = self.client.complete(request_messages, self.registry.schemas(), on_text)
+                message = self.client.complete(request_messages, self.registry.schemas() if tools_active else [ACTIVATE_TOOLS], on_text)
                 self._track_usage(message)
                 self.messages.append(message)
                 final = message.get("content") or final
@@ -132,18 +166,25 @@ class Agent:
                 if not calls:
                     self.sessions.save(self.session_id, self.messages)
                     return final
+                gate_phase = not tools_active
+                if gate_phase:
+                    tools_active = True
                 for call in calls:
                     function = call.get("function") or {}
                     name = str(function.get("name", ""))
-                    try:
-                        args = json.loads(function.get("arguments") or "{}")
-                    except json.JSONDecodeError as exc:
-                        result = f"error: invalid tool arguments: {exc}"
+                    if gate_phase:
                         args = {}
+                        result = "Tools enabled. Retry the task using the newly available tools."
                     else:
-                        if on_tool:
-                            on_tool(name, args)
-                        result = self.registry.execute(name, args)
+                        try:
+                            args = json.loads(function.get("arguments") or "{}")
+                        except json.JSONDecodeError as exc:
+                            result = f"error: invalid tool arguments: {exc}"
+                            args = {}
+                        else:
+                            if on_tool:
+                                on_tool(name, args)
+                            result = self.registry.execute(name, args)
                     self.messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
                 self.sessions.save(self.session_id, self.messages)
             final = f"Stopped after {max_steps} tool steps. Ask me to continue if needed."
@@ -234,6 +275,20 @@ class Agent:
         self.turns.clear()
         self.sessions.save(self.session_id, self.messages)
         return f"ok: compacted conversation to {len(summary)} characters"
+
+    def build_wiki(self) -> dict[str, object]:
+        provider = {**self.config["provider"], "thinking_enabled": True, "reasoning_effort": "low"}
+        wiki_client = create_client(provider)
+
+        def generate(prompt: str) -> str:
+            response = wiki_client.complete(
+                [{"role": "system", "content": "You compile source-grounded project documentation."}, {"role": "user", "content": prompt}],
+                [],
+            )
+            self._track_usage(response)
+            return str(response.get("content") or "")
+
+        return self.wiki.build(generate)
 
     def export(self, raw_path: str | None = None) -> Path:
         path = Path(raw_path) if raw_path else Path(".chattyplay") / "exports" / f"{self.session_id}.md"

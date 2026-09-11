@@ -1,6 +1,6 @@
 # ChattyPlay Agent Terminal
 
-一个本地优先、跨平台的终端 AI 编程助手。支持 OpenAI 兼容协议与 Anthropic Messages API、Ollama 免 Key 本地模型、LangChain + SQLite 项目 RAG、流式工具调用、多模态图片上下文、思考模式与推理强度、原子写入与可撤销的文件编辑/移动/删除、Shell、网页与浏览器、跨平台剪贴板、Skills、MCP、计划模式、只读子 Agent 编排、Agent 追问与任务清单、会话恢复/分叉/导出/压缩、Token 统计、Provider 热切换，以及可视化配置页面。
+一个本地优先、跨平台的终端 AI 编程助手。支持 OpenAI 兼容协议与 Anthropic Messages API、Ollama 免 Key 本地模型、LLM Wiki 持久项目知识库、LangChain + SQLite 项目 RAG、流式工具调用、多模态图片上下文、思考模式与推理强度、原子写入与可撤销的文件编辑/移动/删除、Shell、网页与浏览器、跨平台剪贴板、Skills、MCP、计划模式、只读子 Agent 编排、Agent 追问与任务清单、会话恢复/分叉/导出/压缩、Token 统计、Provider 热切换，以及可视化配置页面。
 
 ## 效果图
 
@@ -53,7 +53,7 @@ chattyplay --setup-local           # 部署并选择推荐 Ollama 模型
 
 直接运行 `chattyplay` 会在当前 macOS/Windows 终端中显示响应式 ChattyPlay ASCII 欢迎页并进入交互界面；宽终端显示双栏最近会话与快捷入口，窄终端自动切换单栏。`chattyplay --web` 才会打开仅监听本机的可视化配置页。
 
-终端支持模型首字前 loading、逐段流式回复、历史记录、命令补全、`Ctrl+J` 多行输入、`Shift+Tab` 切换计划模式，以及 `@relative/path` 文本或图片引用（PNG/JPEG/GIF/WebP，视觉模型可直接理解）。运行 `/help` 可查看全部命令；`/run <命令>` 可在现有权限与安全规则保护下直接运行测试、构建或 Git 命令，`/reload` 热重载配置，`/copy` 复制最近回复，`/thinking high` 调整推理强度，`/skills enable 名称` 启用技能，`/ollama use [模型]` 切换免 Key 本地模型，`/ollama pull [模型]` 拉取指定模型，`/rag index` 建立项目语义索引，`/rag search 问题` 可直接检索。源码变更后索引会标记为过期并要求重建。Agent 也会获得 `search_codebase` 工具。根目录 `AGENTS.md` 会作为项目指令载入。
+终端支持带耗时与中断提示的首字前 loading、逐段流式回复、历史记录、命令补全、`Ctrl+J` 多行输入、`Shift+Tab` 切换计划模式，以及 `@relative/path` 文本或图片引用（PNG/JPEG/GIF/WebP，视觉模型可直接理解）。本地 Ollama 默认显式关闭长思考并限制历史上下文以降低首字延迟；复杂任务可用 `/thinking low|medium|high` 临时提高推理强度，再用 `/thinking off` 恢复快速模式。运行 `/help` 可查看全部命令；`/run <命令>` 可在现有权限与安全规则保护下直接运行测试、构建或 Git 命令，`/wiki build` 用当前模型编译可持续更新的项目 Wiki，`/wiki status` 检查是否过期，`/wiki show` 查看内容；RAG 继续用于精确源码检索。`/reload` 热重载配置，`/copy` 复制最近回复，`/skills enable 名称` 启用技能，`/ollama use [模型]` 切换免 Key 本地模型，`/ollama pull [模型]` 拉取指定模型，`/rag index` 建立项目语义索引，`/rag search 问题` 可直接检索。源码变更后索引与 Wiki 会标记为过期并要求重建。Agent 获得 `search_codebase` 与 `read_project_wiki` 工具。根目录 `AGENTS.md` 会作为项目指令载入。
 
 写文件、Shell、浏览器、剪贴板和 MCP 默认逐次确认：输入 `a` 对当前进程放行，输入 `p` 写入项目配置并长期放行；`-y` 仅适合可信任务。
 
@@ -122,7 +122,7 @@ Skills 按项目优先级从 `.chattyplay/skills/*/SKILL.md`、`.agents/skills/*
 ## 安全边界
 
 - 文件工具解析真实路径并限制在当前工作区，包含软链接越界防护。
-- 高副作用工具按 `allow / ask / deny` 配置；系统级破坏命令有不可绕过的硬阻止。
+- 高副作用工具按 `allow / ask / deny` 配置；常见系统级破坏命令还有额外阻止。Shell 获准后等同当前用户权限，请仅批准可信命令。
 - 配置服务只监听 `127.0.0.1`，写操作还需要每次启动随机生成的页面令牌。
 - Shell 本身能力很强；批准命令前仍应阅读终端展示的命令预览。
 

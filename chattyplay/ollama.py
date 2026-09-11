@@ -36,4 +36,7 @@ def pull(model: str) -> None:
 
 
 def provider(model: str = CHAT_MODEL) -> dict[str, Any]:
-    return {"api_style": "openai", "base_url": BASE_URL + "/v1", "api_key_env": "", "model": model}
+    return {
+        "api_style": "openai", "base_url": BASE_URL + "/v1", "api_key_env": "", "model": model,
+        "thinking_enabled": False, "reasoning_effort": "none", "max_tokens": 4096,
+    }

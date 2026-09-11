@@ -19,7 +19,7 @@ from prompt_toolkit.utils import get_cwidth
 
 from chattyplay.config import ConfigStore
 from chattyplay.client import AnthropicClient, OpenAIClient, create_client
-from chattyplay.cli import _format_shell_result, _reload_agent
+from chattyplay.cli import _format_shell_result, _is_command, _reload_agent
 from chattyplay.agent import Agent
 from chattyplay.sessions import SessionStore
 from chattyplay.mcp import MCPManager
@@ -28,6 +28,7 @@ from chattyplay.skills import discover
 from chattyplay.terminal import Spinner, welcome_screen
 from chattyplay.tools import ToolRegistry
 from chattyplay.webui import create_server
+from chattyplay.wiki import ProjectWiki
 
 
 class CoreTests(unittest.TestCase):
@@ -41,12 +42,14 @@ class CoreTests(unittest.TestCase):
     def test_welcome_screen_adapts_to_terminal_width(self) -> None:
         wide = welcome_screen("qwen3.5:9b-q4_K_M", self.root, "current", ["previous"], 100)
         narrow = welcome_screen("本地模型", self.root, "current", [], 36)
+        tiny = welcome_screen("本地模型", self.root, "current", [], 24)
         self.assertIn("ChattyPlay", wide)
         self.assertNotIn("v0.8.0", wide)
         self.assertIn("previous", wide)
         self.assertIn("No recent activity", narrow)
         self.assertTrue(all(get_cwidth(line) <= 100 for line in wide.splitlines()))
         self.assertTrue(all(get_cwidth(line) <= 36 for line in narrow.splitlines()))
+        self.assertTrue(all(get_cwidth(line) <= 24 for line in tiny.splitlines()))
 
     def test_spinner_renders_and_clears_on_a_tty(self) -> None:
         class TTYBuffer(io.StringIO):
@@ -60,6 +63,19 @@ class CoreTests(unittest.TestCase):
         spinner.stop()
         self.assertIn("thinking...", output.getvalue())
         self.assertTrue(output.getvalue().endswith("\r"))
+
+        calls = 0
+        def clock() -> float:
+            nonlocal calls
+            calls += 1
+            return 0.0 if calls == 1 else 3.0
+        delayed = TTYBuffer()
+        with patch("chattyplay.terminal.time.monotonic", side_effect=clock):
+            spinner = Spinner(stream=delayed)
+            spinner.start()
+            time.sleep(0.02)
+            spinner.stop()
+        self.assertIn("Ctrl+C to cancel", delayed.getvalue())
 
     def test_file_tools_and_workspace_boundary(self) -> None:
         tools = ToolRegistry(self.root, {"read": "allow", "write": "allow"})
@@ -83,6 +99,8 @@ class CoreTests(unittest.TestCase):
     def test_permissions_and_hard_deny(self) -> None:
         tools = ToolRegistry(self.root, {"shell": "allow"})
         self.assertIn("blocked", tools.execute("shell", {"command": "rm -rf /"}))
+        self.assertIn("blocked", tools.execute("shell", {"command": "  rm -rf /"}))
+        self.assertIn("blocked", tools.execute("shell", {"command": "echo ok\nrm -rf /"}))
         denied = ToolRegistry(self.root, {"write": "deny"})
         self.assertIn("denied", denied.execute("write_file", {"path": "x", "content": "x"}))
         asked: list[str] = []
@@ -107,11 +125,20 @@ class CoreTests(unittest.TestCase):
         skill_path.parent.mkdir(parents=True)
         skill_path.write_text("---\nname: demo\ndescription: Demo\n---\nDo it.\n", encoding="utf-8")
         self.assertIn("demo", discover(self.root, [".chattyplay/skills"]))
+        with tempfile.TemporaryDirectory() as external:
+            outside = Path(external) / "outside"
+            outside.mkdir()
+            (outside / "SKILL.md").write_text("---\nname: outside\n---\nDo it.\n", encoding="utf-8")
+            self.assertNotIn("outside", discover(self.root, [external]))
         sessions = SessionStore(self.root)
         sessions.save("test", [{"role": "user", "content": "hi"}])
         self.assertEqual(sessions.load("test")[0]["content"], "hi")
         with self.assertRaisesRegex(ValueError, "permissions"):
             store.save_project({"permissions": []})
+        with self.assertRaisesRegex(ValueError, "overlap_lines"):
+            store.save_project({"rag": {"chunk_lines": 10, "overlap_lines": 10}})
+        with self.assertRaisesRegex(ValueError, "max_steps"):
+            store.save_project({"agent": {"max_steps": 0}})
         store.save_project({"providerProfiles": {"local": {"base_url": "http://127.0.0.1:11434/v1", "api_key_env": "", "model": "local"}}})
         self.assertEqual(store.load()["providerProfiles"]["local"]["model"], "local")
 
@@ -174,8 +201,22 @@ class CoreTests(unittest.TestCase):
         with patch("chattyplay.client.urllib.request.urlopen", return_value=response) as request:
             OpenAIClient(provider).complete([], [])
         payload = json.loads(request.call_args.args[0].data)
-        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertNotIn("thinking", payload)
         self.assertEqual(payload["reasoning_effort"], "high")
+        no_thought = io.BytesIO(b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}')
+        no_thought.headers = {"Content-Type": "application/json"}
+        provider.update({"thinking_enabled": False, "reasoning_effort": "none"})
+        with patch("chattyplay.client.urllib.request.urlopen", return_value=no_thought) as request:
+            OpenAIClient(provider).complete([], [])
+        payload = json.loads(request.call_args.args[0].data)
+        self.assertNotIn("thinking", payload)
+        self.assertEqual(payload["reasoning_effort"], "none")
+        local = io.BytesIO(b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}')
+        local.headers = {"Content-Type": "application/json"}
+        provider.update({"base_url": "http://127.0.0.1:11434/v1", "reasoning_effort": "medium"})
+        with patch("chattyplay.client.urllib.request.urlopen", return_value=local) as request:
+            OpenAIClient(provider).complete([], [])
+        self.assertEqual(json.loads(request.call_args.args[0].data)["reasoning_effort"], "none")
 
     def test_anthropic_messages_and_stream_are_normalized(self) -> None:
         messages = AnthropicClient._messages([
@@ -226,6 +267,28 @@ class CoreTests(unittest.TestCase):
         finally:
             agent.close()
 
+    def test_agent_uses_lightweight_tool_gate_before_full_schema(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.schemas: list[list[dict]] = []
+
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+                self.schemas.append(tools)
+                if len(self.schemas) == 1:
+                    return {"role": "assistant", "content": None, "tool_calls": [{"id": "gate", "function": {"name": "activate_tools", "arguments": "{}"}}]}
+                return {"role": "assistant", "content": "done"}
+
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        agent = Agent(self.root, config)
+        fake = FakeClient()
+        agent.client = fake
+        try:
+            self.assertEqual(agent.run("inspect the repository"), "done")
+            self.assertEqual([tool["function"]["name"] for tool in fake.schemas[0]], ["activate_tools"])
+            self.assertIn("read_file", [tool["function"]["name"] for tool in fake.schemas[1]])
+        finally:
+            agent.close()
+
     def test_agent_plan_mentions_fork_and_export(self) -> None:
         (self.root / "note.txt").write_text("important context", encoding="utf-8")
         (self.root / "screen.png").write_bytes(b"\x89PNG\r\n")
@@ -273,10 +336,16 @@ class CoreTests(unittest.TestCase):
         result = _format_shell_result('{"exit_code": 2, "stdout": "built\\n", "stderr": "failed\\n"}')
         self.assertEqual(result, "built\nfailed\n[exit 2]")
         self.assertEqual(_format_shell_result("error: blocked"), "error: blocked")
+        self.assertTrue(_is_command("/model local", "/model"))
+        self.assertFalse(_is_command("/modelx", "/model"))
 
     def test_rag_indexes_and_semantically_searches_project(self) -> None:
         (self.root / "alpha.py").write_text("def login():\n    return 'session token'\n", encoding="utf-8")
         (self.root / "beta.py").write_text("def invoice():\n    return 'payment total'\n", encoding="utf-8")
+        (self.root / ".mypy_cache").mkdir()
+        (self.root / ".mypy_cache" / "noise.json").write_text('{"noise": true}', encoding="utf-8")
+        (self.root / "demo.egg-info").mkdir()
+        (self.root / "demo.egg-info" / "sources.txt").write_text("noise", encoding="utf-8")
 
         def embed(texts: list[str]) -> list[list[float]]:
             return [[1.0, 0.0] if "login" in text.lower() else [0.0, 1.0] for text in texts]
@@ -292,6 +361,41 @@ class CoreTests(unittest.TestCase):
         self.assertIn("error", rag.status())
         self.assertEqual(rag.index()["files"], 2)
 
+    def test_project_wiki_build_read_and_staleness(self) -> None:
+        (self.root / "README.md").write_text("# Demo\n", encoding="utf-8")
+        wiki = ProjectWiki(self.root)
+        result = wiki.build(lambda prompt: "```markdown\n# Generated\n\n## Overview\nSee [README.md](../../README.md).\n```")
+        self.assertEqual(result["files"], 1)
+        self.assertTrue(wiki.status()["built"])
+        self.assertIn("# Project Wiki", wiki.read())
+        (self.root / "README.md").write_text("# Changed\n", encoding="utf-8")
+        self.assertTrue(wiki.status()["stale"])
+        self.assertIn("WARNING", wiki.read())
+        with self.assertRaisesRegex(RuntimeError, "empty wiki section"):
+            wiki.build(lambda _: "")
+        with self.assertRaisesRegex(RuntimeError, "without sufficient valid source citations"):
+            wiki.build(lambda _: "See [missing](../../missing.py).")
+        linked = wiki.build(lambda _: "See `README.md` for details.")
+        self.assertEqual(linked["files"], 1)
+        self.assertIn("[README.md](../../README.md)", wiki.read())
+        self.assertIn("# Project Wiki", wiki.read())
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaisesRegex(RuntimeError, "no source files"):
+                ProjectWiki(Path(empty)).build(lambda _: "unused")
+
+    def test_agent_does_not_start_mcp_without_permission(self) -> None:
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["mcpServers"] = {"untrusted": {"command": "anything"}, "off": {"disabled": True}}
+        config["permissions"]["mcp"] = "ask"
+        with patch("chattyplay.agent.MCPManager.connect") as connect:
+            agent = Agent(self.root, config, confirm=lambda *_: False)
+            try:
+                connect.assert_not_called()
+                self.assertEqual(agent.mcp.status["untrusted"], "permission denied")
+                self.assertEqual(agent.mcp.status["off"], "disabled")
+            finally:
+                agent.close()
+
     def test_rag_skips_symlinks_and_reload_preserves_undo(self) -> None:
         outside = Path(self.temp.name).parent / (self.root.name + "-outside.py")
         outside.write_text("secret = 'outside'\n", encoding="utf-8")
@@ -302,6 +406,9 @@ class CoreTests(unittest.TestCase):
                 self.skipTest("symlinks unavailable")
             rag = RAGIndex(self.root, {"chunk_lines": 80, "overlap_lines": 10}, lambda texts: [[1.0] for _ in texts])
             self.assertEqual(rag.index()["files"], 0)
+            tools = ToolRegistry(self.root, {"read": "allow"})
+            self.assertEqual(tools.execute("glob_files", {"pattern": "*.py"}), "none")
+            self.assertEqual(tools.execute("grep_files", {"pattern": "secret", "glob": "*.py"}), "none")
             store = ConfigStore(self.root, self.root / "user.json")
             store.save_project({"permissions": {"write": "allow"}})
             agent = Agent(self.root, store.load())

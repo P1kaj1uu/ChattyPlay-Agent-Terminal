@@ -8,7 +8,7 @@ import threading
 import webbrowser
 import platform
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import __version__
 from .agent import Agent
@@ -30,7 +30,7 @@ def _enable_windows_ansi() -> None:
         return
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = getattr(ctypes, "windll").kernel32
         handle = kernel32.GetStdHandle(-11)
         mode = ctypes.c_uint()
         if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
@@ -80,6 +80,7 @@ def _print_help() -> None:
   /run <command>     run a shell command through the permission and safety layer
   /ollama [status|use [model]|pull [model]]  manage keyless local models
   /rag [status|index|search] manage project semantic search
+  /wiki [status|build|show] manage the LLM-compiled project wiki
   /web                open the visual config editor
   /exit               quit
 """)
@@ -110,12 +111,22 @@ def _format_shell_result(result: str) -> str:
     return f"{body + chr(10) if body else ''}[exit {payload['exit_code']}]"
 
 
+def _is_command(prompt: str, name: str) -> bool:
+    return prompt == name or prompt.startswith(name + " ")
+
+
+def _confirmation(store: ConfigStore, yes: bool, interactive_io: bool = True) -> Callable[[str, str], bool | str]:
+    def decide(category: str, preview: str) -> bool | str:
+        return True if yes else confirm(category, preview, store) if interactive_io else False
+    return decide
+
+
 def _new_agent(workspace: Path, store: ConfigStore, yes: bool, session_id: str | None = None, interactive_io: bool = True) -> Agent:
     messages = SessionStore(workspace).load(session_id) if session_id else None
     return Agent(
         workspace,
         store.load(),
-        confirm=(lambda *_: True) if yes else (lambda category, preview: confirm(category, preview, store)),
+        confirm=_confirmation(store, yes, interactive_io),
         ask_user=_ask_user if interactive_io else None,
         on_plan=_show_plan if interactive_io else None,
         session_id=session_id,
@@ -127,7 +138,7 @@ def _reload_agent(agent: Agent, workspace: Path, store: ConfigStore, yes: bool) 
     replacement = Agent(
         workspace,
         store.load(),
-        confirm=(lambda *_: True) if yes else (lambda category, preview: confirm(category, preview, store)),
+        confirm=_confirmation(store, yes),
         ask_user=_ask_user,
         on_plan=_show_plan,
         session_id=agent.session_id,
@@ -148,6 +159,8 @@ def _doctor(agent: Agent) -> str:
     local = ollama_status()
     rag = agent.rag.status()
     rag_health = "invalid: " + rag["error"] if rag.get("error") else "stale; rebuild with /rag index" if rag.get("stale") else f"{rag['chunks']} indexed chunk(s)" if rag.get("indexed") else "not indexed"
+    wiki = agent.wiki.status()
+    wiki_health = "invalid: " + str(wiki["error"]) if wiki.get("error") else "stale; rebuild with /wiki build" if wiki.get("stale") else f"compiled from {wiki.get('files', 0)} file(s)" if wiki.get("built") else "not built"
     checks = [
         f"python: {platform.python_version()} ({platform.system()})",
         f"workspace: {'writable' if os.access(agent.workspace, os.W_OK) else 'read-only'} · {agent.workspace}",
@@ -157,6 +170,7 @@ def _doctor(agent: Agent) -> str:
         "mcp: " + (", ".join(f"{name}={status}" for name, status in agent.mcp.status.items()) or "none"),
         f"ollama: {'running' if local['running'] else 'installed, stopped' if local['installed'] else 'not installed'} · {len(local['models'])} model(s)",
         f"rag: {rag_health}",
+        f"wiki: {wiki_health}",
     ]
     return "\n".join(checks)
 
@@ -192,7 +206,7 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
         if prompt == "/new":
             agent.close(); agent = _new_agent(workspace, store, yes)
             print(f"{GREEN}new session {agent.session_id}{RESET}"); continue
-        if prompt.startswith("/resume"):
+        if _is_command(prompt, "/resume"):
             parts = prompt.split(maxsplit=1)
             if len(parts) == 1:
                 print("\n".join(SessionStore(workspace).list()[:30]) or "no sessions")
@@ -213,14 +227,14 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
             except Exception as exc:
                 print(f"{RED}compact failed: {exc}{RESET}")
             continue
-        if prompt.startswith("/export"):
+        if _is_command(prompt, "/export"):
             parts = prompt.split(maxsplit=1)
             try:
                 print(f"{GREEN}exported {agent.export(parts[1] if len(parts) == 2 else None)}{RESET}")
             except (OSError, PermissionError) as exc:
                 print(f"{RED}{exc}{RESET}")
             continue
-        if prompt.startswith("/model"):
+        if _is_command(prompt, "/model"):
             parts = prompt.split(maxsplit=1)
             if len(parts) == 1:
                 print(agent.config["provider"]["model"])
@@ -231,7 +245,7 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
                 agent.set_provider(store.load()["provider"])
                 print(f"{GREEN}model: {parts[1]}{RESET}")
             continue
-        if prompt.startswith("/provider"):
+        if _is_command(prompt, "/provider"):
             parts = prompt.split(maxsplit=1)
             profiles = agent.config.get("providerProfiles", {})
             if len(parts) == 1:
@@ -246,7 +260,7 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
                 agent.set_provider(provider)
                 print(f"{GREEN}provider: {parts[1]} · {provider['model']}{RESET}")
             continue
-        if prompt.startswith("/thinking"):
+        if _is_command(prompt, "/thinking"):
             parts = prompt.split(maxsplit=1)
             provider = agent.config["provider"]
             if len(parts) == 1:
@@ -258,19 +272,19 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
                 project = store.project_config()
                 configured = project.setdefault("provider", {})
                 configured["thinking_enabled"] = value != "off"
-                configured["reasoning_effort"] = "medium" if value == "on" else value if value != "off" else configured.get("reasoning_effort", "medium")
+                configured["reasoning_effort"] = "medium" if value == "on" else "none" if value == "off" else value
                 store.save_project(project)
                 agent.set_provider(store.load()["provider"])
                 print(f"{GREEN}thinking: {'off' if value == 'off' else configured['reasoning_effort']}{RESET}")
             continue
-        if prompt.startswith("/plan"):
+        if _is_command(prompt, "/plan"):
             parts = prompt.split(maxsplit=1)
             if len(parts) == 2 and parts[1].lower() not in {"on", "off", "true", "false", "1", "0"}:
                 print(f"{RED}usage: /plan [on|off]{RESET}")
                 continue
-            enabled = (not agent.plan_mode) if len(parts) == 1 else parts[1].lower() in {"on", "true", "1"}
-            agent.set_plan_mode(enabled)
-            print(f"{GREEN}plan mode {'on' if enabled else 'off'}{RESET}")
+            plan_enabled = (not agent.plan_mode) if len(parts) == 1 else parts[1].lower() in {"on", "true", "1"}
+            agent.set_plan_mode(plan_enabled)
+            print(f"{GREEN}plan mode {'on' if plan_enabled else 'off'}{RESET}")
             continue
         if prompt == "/reload":
             try:
@@ -279,19 +293,19 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
             except Exception as exc:
                 print(f"{RED}reload failed: {exc}{RESET}")
             continue
-        if prompt.startswith("/skills"):
+        if _is_command(prompt, "/skills"):
             parts = prompt.split(maxsplit=2)
-            enabled = set(agent.config.get("skills", {}).get("enabled", []))
+            enabled_skills = set(agent.config.get("skills", {}).get("enabled", []))
             if len(parts) == 1:
-                print("\n".join(f"{'*' if name in enabled else '-'} {name}: {skill.description}" for name, skill in agent.skills.items()) or "no skills")
+                print("\n".join(f"{'*' if name in enabled_skills else '-'} {name}: {skill.description}" for name, skill in agent.skills.items()) or "no skills")
             elif len(parts) == 3 and parts[1] in {"enable", "disable"}:
                 name = parts[2]
                 if parts[1] == "enable" and name not in agent.skills:
                     print(f"{RED}unknown skill: {name}{RESET}")
                     continue
-                enabled.add(name) if parts[1] == "enable" else enabled.discard(name)
+                enabled_skills.add(name) if parts[1] == "enable" else enabled_skills.discard(name)
                 project = store.project_config()
-                project.setdefault("skills", {})["enabled"] = sorted(enabled)
+                project.setdefault("skills", {})["enabled"] = sorted(enabled_skills)
                 try:
                     store.save_project(project)
                     agent = _reload_agent(agent, workspace, store, yes)
@@ -339,7 +353,7 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
         if prompt == "/doctor":
             print(_doctor(agent))
             continue
-        if prompt == "/run" or prompt.startswith("/run "):
+        if _is_command(prompt, "/run"):
             parts = prompt.split(maxsplit=1)
             if len(parts) == 1:
                 print(f"{RED}usage: /run <command>{RESET}")
@@ -348,7 +362,7 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
                 color = RED if result.startswith("error:") else ""
                 print(f"{color}{_format_shell_result(result)}{RESET}")
             continue
-        if prompt.startswith("/ollama"):
+        if _is_command(prompt, "/ollama"):
             parts = prompt.split(maxsplit=2)
             action = parts[1].lower() if len(parts) > 1 else "status"
             model = parts[2].strip() if len(parts) > 2 else CHAT_MODEL
@@ -371,13 +385,13 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
             except Exception as exc:
                 print(f"{RED}Ollama: {exc}{RESET}")
             continue
-        if prompt.startswith("/rag"):
+        if _is_command(prompt, "/rag"):
             parts = prompt.split(maxsplit=2)
             action = parts[1].lower() if len(parts) > 1 else "status"
             try:
                 if action == "index":
-                    result = agent.rag.index()
-                    print(f"{GREEN}indexed {result['files']} files / {result['chunks']} chunks{RESET}")
+                    rag_result = agent.rag.index()
+                    print(f"{GREEN}indexed {rag_result['files']} files / {rag_result['chunks']} chunks{RESET}")
                 elif action == "search" and len(parts) == 3:
                     print(agent.rag.search(parts[2]))
                 elif action == "status":
@@ -386,6 +400,29 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
                     print(f"{RED}usage: /rag [status|index|search query]{RESET}")
             except Exception as exc:
                 print(f"{RED}RAG: {exc}{RESET}")
+            continue
+        if _is_command(prompt, "/wiki"):
+            parts = prompt.split(maxsplit=1)
+            action = parts[1].lower() if len(parts) == 2 else "status"
+            if action == "build":
+                if agent.plan_mode:
+                    print(f"{RED}wiki build is unavailable in plan mode{RESET}")
+                    continue
+                spinner = Spinner("compiling project wiki...", style=DIM, reset=RESET)
+                spinner.start()
+                try:
+                    wiki_result = agent.build_wiki()
+                    spinner.stop()
+                    print(f"{GREEN}compiled {wiki_result['files']} files → {wiki_result['path']}{RESET}")
+                except Exception as exc:
+                    spinner.stop()
+                    print(f"{RED}Wiki: {exc}{RESET}")
+            elif action == "show":
+                print(agent.wiki.read())
+            elif action == "status":
+                print(json.dumps(agent.wiki.status(), indent=2, ensure_ascii=False))
+            else:
+                print(f"{RED}usage: /wiki [status|build|show]{RESET}")
             continue
         if prompt == "/web":
             if server is None:

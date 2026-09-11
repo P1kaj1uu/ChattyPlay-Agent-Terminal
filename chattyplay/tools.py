@@ -19,7 +19,7 @@ from . import __version__
 
 
 HARD_DENY = re.compile(
-    r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:rm\s+-[^\n]*(?:r[^\n]*f|f[^\n]*r)\s+(?:/|~|\$HOME|%USERPROFILE%)|mkfs|format\s+[a-z]:|"
+    r"(?:^|[;&|\r\n])\s*(?:sudo\s+)?(?:rm\s+-[^\n]*(?:r[^\n]*f|f[^\n]*r)\s+(?:/|~|\$HOME|%USERPROFILE%)|mkfs|format\s+[a-z]:|"
     r"shutdown|reboot|diskpart|dd\s+if=)|:\(\)\s*\{",
     re.IGNORECASE,
 )
@@ -136,7 +136,7 @@ class ToolRegistry:
 
     def undo(self, checkpoint: int) -> str:
         pending = self.changes[checkpoint:]
-        expected: dict[Path, bytes] = {}
+        expected: dict[Path, bytes | None] = {}
         for change in pending:
             expected[change.path] = change.after
         for path, after in expected.items():
@@ -336,7 +336,7 @@ class ToolRegistry:
         pattern = str(args["pattern"])
         if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
             raise PermissionError("glob must stay inside workspace")
-        matches = [p for p in self.workspace.glob(pattern) if p.is_file()]
+        matches = [p for p in self.workspace.glob(pattern) if p.is_file() and not p.is_symlink()]
         return "\n".join(str(p.relative_to(self.workspace)) for p in sorted(matches)[:1000]) or "none"
 
     def _grep(self, args: dict[str, Any]) -> str:
@@ -346,7 +346,7 @@ class ToolRegistry:
             raise PermissionError("glob must stay inside workspace")
         hits: list[str] = []
         for path in self.workspace.glob(glob_pattern):
-            if not path.is_file() or any(part in {".git", "node_modules", ".venv"} for part in path.parts):
+            if path.is_symlink() or not path.is_file() or any(part in {".git", "node_modules", ".venv"} for part in path.parts):
                 continue
             try:
                 for number, line in enumerate(path.read_text(encoding="utf-8", errors="strict").splitlines(), 1):

@@ -31,14 +31,20 @@ def _parse(path: Path) -> Skill:
 
 def discover(workspace: Path, dirs: Iterable[str]) -> dict[str, Skill]:
     found: dict[str, Skill] = {}
-    roots = [workspace / d for d in dirs]
-    roots.append(Path.home() / ".chattyplay" / "skills")
-    roots.append(Path.home() / ".agents" / "skills")
+    workspace = workspace.resolve()
+    roots: list[Path] = []
+    for directory in dirs:
+        root = (workspace / directory).resolve()
+        if root.is_relative_to(workspace):
+            roots.append(root)
+    roots.extend((Path.home() / ".chattyplay" / "skills", Path.home() / ".agents" / "skills"))
     for root in roots:
         if not root.exists():
             continue
         for path in root.glob("*/SKILL.md"):
             try:
+                if path.stat().st_size > 500_000:
+                    continue
                 skill = _parse(path)
                 if re.fullmatch(r"[\w.-]+", skill.name):
                     found.setdefault(skill.name, skill)
@@ -50,4 +56,3 @@ def discover(workspace: Path, dirs: Iterable[str]) -> dict[str, Skill]:
 def enabled_prompt(skills: dict[str, Skill], enabled: Iterable[str]) -> str:
     selected = [skills[name] for name in enabled if name in skills]
     return "\n\n".join(f"# Skill: {skill.name}\n{skill.instructions}" for skill in selected)
-
