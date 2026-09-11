@@ -436,20 +436,18 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
         printed = False
         def on_text(text: str) -> None:
             nonlocal printed
-            spinner.stop()
-            if not printed:
-                print(f"{GREEN}agent ❯ {RESET}", end="", flush=True)
-                printed = True
-            print(text, end="", flush=True)
+            spinner.write(text, f"{GREEN}agent ❯ {RESET}" if not printed else "")
+            printed = True
         def on_tool(name: str, args: dict[str, Any]) -> None:
             spinner.stop()
             print(f"\n{DIM}  → {name} {json.dumps(args, ensure_ascii=False)[:180]}{RESET}")
         try:
             answer = agent.run(prompt, on_text, on_tool, lambda _: spinner.start())
-            spinner.stop()
             if not printed and answer:
                 print(f"{GREEN}agent ❯ {RESET}{answer}", end="")
-            print("\n")
+            spinner.finish(agent.last_output_tokens)
+            if not printed:
+                print()
         except KeyboardInterrupt:
             spinner.stop()
             print(f"\n{YELLOW}interrupted{RESET}\n")

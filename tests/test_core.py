@@ -77,6 +77,15 @@ class CoreTests(unittest.TestCase):
             spinner.stop()
         self.assertIn("Ctrl+C to cancel", delayed.getvalue())
 
+        streamed = TTYBuffer()
+        spinner = Spinner(stream=streamed)
+        spinner._phase_started = spinner._stream_started = time.monotonic() - 2
+        spinner.write("你好", "agent ❯ ")
+        spinner.finish(20)
+        self.assertIn("thinking... 2.0s · ~1.0 tok/s", streamed.getvalue())
+        self.assertIn("10.0 tok/s", streamed.getvalue())
+        self.assertNotIn("n/a", streamed.getvalue())
+
     def test_file_tools_and_workspace_boundary(self) -> None:
         tools = ToolRegistry(self.root, {"read": "allow", "write": "allow"})
         checkpoint = tools.checkpoint()
@@ -202,6 +211,7 @@ class CoreTests(unittest.TestCase):
             OpenAIClient(provider).complete([], [])
         payload = json.loads(request.call_args.args[0].data)
         self.assertNotIn("thinking", payload)
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertEqual(payload["reasoning_effort"], "high")
         no_thought = io.BytesIO(b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}')
         no_thought.headers = {"Content-Type": "application/json"}

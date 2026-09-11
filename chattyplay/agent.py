@@ -64,6 +64,7 @@ class Agent:
         self.messages = messages or []
         self.turns: list[tuple[int, int]] = []
         self.usage = {"input_tokens": 0, "output_tokens": 0, "tool_calls": 0, "requests": 0}
+        self.last_output_tokens = 0
         agent_config = config.get("agent", {})
         self.registry = ToolRegistry(
             self.workspace,
@@ -355,8 +356,9 @@ class Agent:
 
     def _track_usage(self, message: dict[str, Any]) -> None:
         usage = message.pop("_usage", {})
+        self.last_output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
         self.usage["input_tokens"] += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-        self.usage["output_tokens"] += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        self.usage["output_tokens"] += self.last_output_tokens
         self.usage["requests"] += 1
 
     def _delegate(self, args: dict[str, Any]) -> str:

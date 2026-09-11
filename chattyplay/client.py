@@ -31,6 +31,7 @@ class OpenAIClient:
             "model": self.provider["model"],
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "max_tokens": int(self.provider.get("max_tokens", 8192)),
         }
         if tools:

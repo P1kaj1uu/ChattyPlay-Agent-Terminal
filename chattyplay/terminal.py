@@ -113,29 +113,77 @@ class Spinner:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._rendered_width = 0
+        self._phase_started = 0.0
+        self._stream_started = 0.0
+        self._stream_text = ""
+        self._meter_visible = False
 
     def start(self) -> None:
-        if not self.enabled or (self._thread and self._thread.is_alive()):
+        if self._thread and self._thread.is_alive():
+            return
+        self._phase_started = time.monotonic()
+        self._stream_started = 0.0
+        self._stream_text = ""
+        if not self.enabled:
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        if not self._thread:
-            return
-        self._stop.set()
-        self._thread.join()
-        self._thread = None
-        self.stream.write("\r" + " " * self._rendered_width + "\r")
+        if self._thread:
+            self._stop.set()
+            self._thread.join()
+            self._thread = None
+            self.stream.write("\r" + " " * self._rendered_width + "\r")
+        self._clear_meter()
         self.stream.flush()
 
+    def write(self, text: str, prefix: str = "") -> None:
+        self.stop()
+        now = time.monotonic()
+        self._stream_started = self._stream_started or now
+        self._stream_text += text
+        self.stream.write(prefix + text)
+        self._render_meter(now)
+        self.stream.flush()
+
+    def finish(self, output_tokens: int = 0) -> None:
+        self.stop()
+        if not self._stream_text:
+            return
+        now = time.monotonic()
+        tokens = output_tokens or self._estimated_tokens(self._stream_text)
+        approximate = not output_tokens
+        self.stream.write(f"\n{self.style}{self._metrics(now, tokens, approximate)}{self.reset}\n")
+        self.stream.flush()
+
+    def _render_meter(self, now: float) -> None:
+        if not self.enabled:
+            return
+        label = self._metrics(now, self._estimated_tokens(self._stream_text), True)
+        self.stream.write(f"\033[s\n\r\033[2K{self.style}{label}{self.reset}\033[u")
+        self._meter_visible = True
+
+    def _clear_meter(self) -> None:
+        if self._meter_visible:
+            self.stream.write("\033[s\n\r\033[2K\033[u")
+            self._meter_visible = False
+
+    def _metrics(self, now: float, tokens: int, approximate: bool) -> str:
+        elapsed = max(0.0, now - self._phase_started)
+        generation = max(0.1, now - self._stream_started)
+        return f"thinking... {elapsed:.1f}s · {'~' if approximate else ''}{tokens / generation:.1f} tok/s"
+
+    @staticmethod
+    def _estimated_tokens(text: str) -> int:
+        return max(1, round(sum(1 if ord(char) > 127 else 0.25 for char in text)))
+
     def _spin(self) -> None:
-        started = time.monotonic()
         for symbol in cycle("|/-\\"):
             if self._stop.is_set():
                 return
-            elapsed = int(time.monotonic() - started)
+            elapsed = int(time.monotonic() - self._phase_started)
             label = self.text if elapsed < 2 else f"{self.text} {elapsed}s · Ctrl+C to cancel"
             self._rendered_width = max(self._rendered_width, get_cwidth(label) + 2)
             self.stream.write(f"\r{self.style}{symbol} {label}{self.reset}")
