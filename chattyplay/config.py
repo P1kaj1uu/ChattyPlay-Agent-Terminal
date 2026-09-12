@@ -50,7 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chunk_lines": 80,
         "overlap_lines": 10,
     },
-    "agent": {"max_steps": 30, "max_tool_output": 30000, "max_context_chars": 120000, "max_file_mention_chars": 30000, "max_image_bytes": 5000000, "max_images": 4},
+    "agent": {"max_steps": 30, "max_tool_output": 30000, "max_context_chars": 120000, "auto_compact": True, "auto_compact_ratio": 0.8, "max_file_mention_chars": 30000, "max_image_bytes": 5000000, "max_images": 4},
 }
 
 
@@ -163,6 +163,11 @@ class ConfigStore:
         if not isinstance(merged.get("agent"), dict):
             raise ValueError("agent must be an object")
         agent = merged["agent"]
+        if not isinstance(agent.get("auto_compact"), bool):
+            raise ValueError("agent.auto_compact must be boolean")
+        ratio = agent.get("auto_compact_ratio")
+        if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or not 0.5 <= ratio <= 1:
+            raise ValueError("agent.auto_compact_ratio must be between 0.5 and 1")
         for key in ("max_steps", "max_tool_output", "max_context_chars", "max_file_mention_chars", "max_image_bytes", "max_images"):
             if not isinstance(agent.get(key), int) or isinstance(agent.get(key), bool) or agent[key] < 1:
                 raise ValueError(f"agent.{key} must be a positive integer")

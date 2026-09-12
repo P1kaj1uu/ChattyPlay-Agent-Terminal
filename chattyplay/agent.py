@@ -144,6 +144,7 @@ class Agent:
         on_tool: Callable[[str, dict[str, Any]], None] | None = None,
         on_status: Callable[[str], None] | None = None,
     ) -> str:
+        self._auto_compact(on_status)
         content = self._attach_mentions(prompt)
         self.turns.append((self.registry.checkpoint(), len(self.messages)))
         self.messages.append({"role": "user", "content": content})
@@ -256,7 +257,56 @@ class Agent:
     def compact(self) -> str:
         if len(self.messages) < 4:
             return "error: conversation is already compact"
-        source = json.dumps(self.context_messages(), ensure_ascii=False)
+        summary = self._summarize(self.messages)
+        self.messages = [
+            {"role": "user", "content": "Previous session summary:\n" + summary},
+            {"role": "assistant", "content": "Understood. I will continue from this summary."},
+        ]
+        self.turns.clear()
+        self.sessions.save(self.session_id, self.messages)
+        return f"ok: compacted conversation to {len(summary)} characters"
+
+    def _auto_compact(self, on_status: Callable[[str], None] | None = None) -> bool:
+        config = self.config.get("agent", {})
+        limit = int(config.get("max_context_chars", 500000))
+        if not config.get("auto_compact", True) or len(json.dumps(self.messages, ensure_ascii=False)) < limit * float(config.get("auto_compact_ratio", 0.8)):
+            return False
+        turns: list[list[dict[str, Any]]] = []
+        for message in self.messages:
+            if message.get("role") == "user":
+                turns.append([message])
+            elif not turns:
+                turns.append([message])
+            else:
+                turns[-1].append(message)
+        recent: list[list[dict[str, Any]]] = []
+        used = 0
+        for turn in reversed(turns):
+            size = len(json.dumps(turn, ensure_ascii=False))
+            if recent and used + size > limit // 2:
+                break
+            recent.append(turn)
+            used += size
+        old = turns[: len(turns) - len(recent)]
+        if not old:
+            return False
+        if on_status:
+            on_status("compacting")
+        try:
+            summary = self._summarize([message for turn in old for message in turn])
+        except Exception:
+            return False
+        self.messages = [
+            {"role": "user", "content": "Previous session summary:\n" + summary},
+            {"role": "assistant", "content": "Understood. I will continue from this summary."},
+            *[message for turn in reversed(recent) for message in turn],
+        ]
+        self.turns.clear()
+        self.sessions.save(self.session_id, self.messages)
+        return True
+
+    def _summarize(self, messages: list[dict[str, Any]]) -> str:
+        source = json.dumps(messages, ensure_ascii=False)
         prompt = (
             "Summarize this coding session for another agent. Preserve user requirements, decisions, "
             "files changed, commands/results, unresolved problems, and next steps. Be concise and factual.\n\n" + source
@@ -268,14 +318,8 @@ class Agent:
         self._track_usage(response)
         summary = response.get("content")
         if not summary:
-            return "error: model returned no summary"
-        self.messages = [
-            {"role": "user", "content": "Previous session summary:\n" + summary},
-            {"role": "assistant", "content": "Understood. I will continue from this summary."},
-        ]
-        self.turns.clear()
-        self.sessions.save(self.session_id, self.messages)
-        return f"ok: compacted conversation to {len(summary)} characters"
+            raise RuntimeError("model returned no summary")
+        return str(summary)
 
     def build_wiki(self) -> dict[str, object]:
         provider = {**self.config["provider"], "thinking_enabled": True, "reasoning_effort": "low"}

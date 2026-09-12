@@ -203,8 +203,8 @@ class ToolRegistry:
             "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 2000}},
             "required": ["path"],
         }, "read", self._read))
-        self.add(Tool("write_file", "Create or replace a UTF-8 text file inside the workspace.", {
-            **obj, "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]
+        self.add(Tool("write_file", "Atomically create or replace a UTF-8 text file. Pass the SHA-256 from read_file when overwriting to reject stale writes.", {
+            **obj, "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "expected_sha256": {"type": "string"}}, "required": ["path", "content"]
         }, "write", self._write))
         self.add(Tool("edit_file", "Replace an exact, unique string in a file. Read first and pass expected_sha256 to reject stale edits.", {
             **obj, "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_sha256": {"type": "string"}}, "required": ["path", "old_text", "new_text"]
@@ -264,6 +264,12 @@ class ToolRegistry:
         before = path.read_bytes() if path.exists() and path.is_file() else None
         before_mode = path.stat().st_mode & 0o7777 if before is not None else None
         after = str(args["content"]).encode("utf-8")
+        expected = args.get("expected_sha256")
+        actual = hashlib.sha256(before).hexdigest() if before is not None else "missing"
+        if expected and str(expected) != actual:
+            raise ValueError(f"stale file version: expected {expected}, current {actual}")
+        if before == after:
+            return f"ok: unchanged {path.relative_to(self.workspace)}"
         self._replace_bytes(path, after)
         self.changes.append(Change(path, before, after, before_mode))
         return f"ok: wrote {path.relative_to(self.workspace)}"
@@ -282,6 +288,8 @@ class ToolRegistry:
         if count != 1:
             raise ValueError(f"old_text must occur exactly once; found {count}")
         after = content.replace(old, str(args["new_text"]), 1).encode("utf-8")
+        if before == after:
+            return f"ok: unchanged {path.relative_to(self.workspace)}"
         self._replace_bytes(path, after)
         self.changes.append(Change(path, before, after, before_mode))
         return f"ok: edited {path.relative_to(self.workspace)}"

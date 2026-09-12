@@ -93,6 +93,8 @@ class CoreTests(unittest.TestCase):
         read = tools.execute("read_file", {"path": "src/a.py"})
         self.assertIn("x = 1", read)
         version = hashlib.sha256(b"x = 1\n").hexdigest()
+        self.assertIn("ok: unchanged", tools.execute("write_file", {"path": "src/a.py", "content": "x = 1\n", "expected_sha256": version}))
+        self.assertIn("stale file version", tools.execute("write_file", {"path": "src/a.py", "content": "changed", "expected_sha256": "old"}))
         self.assertIn("ok: edited", tools.execute("edit_file", {"path": "src/a.py", "old_text": "1", "new_text": "2", "expected_sha256": version}))
         (self.root / "src" / "a.py").chmod(0o755)
         self.assertIn("stale file version", tools.execute("edit_file", {"path": "src/a.py", "old_text": "2", "new_text": "3", "expected_sha256": version}))
@@ -289,6 +291,62 @@ class CoreTests(unittest.TestCase):
         try:
             agent.messages = [{"role": "user", "content": "x" * 2000}]
             self.assertEqual(agent.context_messages(), agent.messages)
+        finally:
+            agent.close()
+
+    def test_auto_compact_summarizes_old_turns_and_keeps_recent_turns(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.source = ""
+
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+                self.source = messages[-1]["content"]
+                return {"role": "assistant", "content": "old work summary"}
+
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["agent"]["max_context_chars"] = 1000
+        agent = Agent(self.root, config)
+        fake = FakeClient()
+        agent.client = fake
+        try:
+            agent.messages = [
+                {"role": "user", "content": "oldest " * 100},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "recent question"},
+                {"role": "assistant", "content": "recent answer"},
+            ]
+            self.assertTrue(agent._auto_compact())
+            self.assertIn("oldest", fake.source)
+            self.assertEqual(agent.messages[-2]["content"], "recent question")
+            self.assertEqual(agent.messages[-1]["content"], "recent answer")
+            self.assertIn("old work summary", agent.messages[0]["content"])
+            self.assertEqual(SessionStore(self.root).load(agent.session_id), agent.messages)
+        finally:
+            agent.close()
+
+    def test_manual_compact_includes_history_outside_active_context(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.source = ""
+
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+                self.source = messages[-1]["content"]
+                return {"role": "assistant", "content": "summary"}
+
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["agent"]["max_context_chars"] = 1000
+        agent = Agent(self.root, config)
+        fake = FakeClient()
+        agent.client = fake
+        try:
+            agent.messages = [
+                {"role": "user", "content": "forgotten " * 300},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "latest"},
+                {"role": "assistant", "content": "latest answer"},
+            ]
+            self.assertIn("ok: compacted", agent.compact())
+            self.assertIn("forgotten", fake.source)
         finally:
             agent.close()
 
