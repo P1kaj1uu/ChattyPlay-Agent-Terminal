@@ -13,13 +13,14 @@ from .mcp import MCPManager
 from .rag import RAGIndex
 from .sessions import SessionStore
 from .skills import discover, enabled_prompt
-from .tools import Tool, ToolRegistry
+from .tools import Change, Tool, ToolRegistry
 from .wiki import ProjectWiki
 
 
 BASE_PROMPT = """You are ChattyPlay, a local AI coding agent.
 Work directly in the current workspace and finish the user's task end to end.
 Inspect existing code before editing. Prefer small root-cause fixes and existing project patterns.
+For new files, use create_file with the path and concise implementation instructions, not write_file with the entire source. create_file creates the file first and streams its contents directly. Include all requirements and relevant context in its instructions. Use edit_file for changes to existing files.
 Use tools whenever facts depend on local files or commands. Never invent tool results.
 Keep edits inside the workspace. Run the smallest relevant verification after non-trivial edits.
 Do not perform destructive, irreversible, privileged, or externally visible actions without explicit user approval.
@@ -35,6 +36,16 @@ ACTIVATE_TOOLS = {
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 }
+
+
+def _tool_status(name: str, arguments: str) -> str:
+    action = "writing" if name == "write_file" else "editing" if name == "edit_file" else name
+    match = re.search(r'"path"\s*:\s*("(?:\\.|[^"\\])*")', arguments)
+    try:
+        path = json.loads(match.group(1)) if match else "file"
+    except json.JSONDecodeError:
+        path = "file"
+    return f"{action} {path} · {len(arguments):,} chars..."
 
 
 def _project_instructions(workspace: Path) -> str:
@@ -136,6 +147,47 @@ class Agent:
         )
         self.client = create_client(config["provider"])
         self.plan_mode = False
+        self._on_file = None
+        self.registry.add(Tool(
+            "create_file",
+            "Create a NEW file immediately, then generate and write its content progressively. Supply concise instructions and relevant context, NOT the full file contents. Existing files are never overwritten.",
+            {"type": "object", "properties": {"path": {"type": "string"}, "instructions": {"type": "string"}}, "required": ["path", "instructions"], "additionalProperties": False},
+            "write", self._create_file,
+        ))
+
+    def _create_file(self, args: dict[str, Any]) -> str:
+        path = self.registry._path(args["path"])
+        instructions = args.get("instructions")
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise ValueError("instructions must be a non-empty string")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive creation prevents a generated file from replacing user work.
+        handle = path.open("xb")
+        chunks: list[str] = []
+        try:
+            if self._on_file:
+                self._on_file(str(args["path"]), "")
+            def write(chunk: str) -> None:
+                handle.write(chunk.encode("utf-8"))
+                handle.flush()
+                chunks.append(chunk)
+                if self._on_file:
+                    self._on_file(str(args["path"]), "".join(chunks))
+            response = self.client.complete([
+                {"role": "system", "content": self.system + "\nFor this file-generation request, output only the exact complete file contents. No Markdown fences, explanations, summaries or tool calls."},
+                {"role": "user", "content": f"File: {args['path']}\nRequirements:\n{instructions}"},
+            ], [], write)
+            self._track_usage(response)
+            if not chunks:
+                raise ValueError("model produced no file content")
+        except BaseException:
+            handle.close()
+            path.unlink()
+            raise
+        finally:
+            handle.close()
+        self.registry.changes.append(Change(path, None, "".join(chunks).encode("utf-8")))
+        return f"ok: created {path.relative_to(self.workspace)}"
 
     def run(
         self,
@@ -143,7 +195,9 @@ class Agent:
         on_text: Callable[[str], None] | None = None,
         on_tool: Callable[[str, dict[str, Any]], None] | None = None,
         on_status: Callable[[str], None] | None = None,
+        on_file: Callable[[str, str], None] | None = None,
     ) -> str:
+        self._on_file = on_file
         self._auto_compact(on_status)
         content = self._attach_mentions(prompt)
         self.turns.append((self.registry.checkpoint(), len(self.messages)))
@@ -159,13 +213,29 @@ class Agent:
                 request_messages = [{"role": "system", "content": system}, *self.context_messages()]
                 if on_status:
                     on_status("thinking")
-                message = self.client.complete(request_messages, self.registry.schemas() if tools_active else [ACTIVATE_TOOLS], on_text)
+                schemas = self.registry.schemas() if tools_active else [ACTIVATE_TOOLS]
+                def tool_delta(name: str, args: str) -> None:
+                    if self.plan_mode or not tools_active:
+                        return
+                    if name == "write_file":
+                        streaming = self.registry.stream_write(args, lambda: on_status("") if on_status else None)
+                        if on_status:
+                            on_status(_tool_status(name, args) if streaming else "thinking")
+                    elif name == "edit_file" and on_status:
+                        on_status(_tool_status(name, args))
+                    if on_file and name in {"write_file", "edit_file"}:
+                        path = self.registry._partial_string(args, "path")
+                        content = self.registry._partial_string(args, "content" if name == "write_file" else "new_text", partial=True)
+                        if path and content is not None:
+                            on_file(path, content)
+                message = self.client.complete(request_messages, schemas, on_text, tool_delta)
                 self._track_usage(message)
                 self.messages.append(message)
                 final = message.get("content") or final
                 calls = message.get("tool_calls") or []
                 self.usage["tool_calls"] += len(calls)
                 if not calls:
+                    self.registry.cancel_stream_write()
                     self.sessions.save(self.session_id, self.messages)
                     return final
                 gate_phase = not tools_active
@@ -181,19 +251,24 @@ class Agent:
                         try:
                             args = json.loads(function.get("arguments") or "{}")
                         except json.JSONDecodeError as exc:
+                            self.registry.cancel_stream_write()
                             result = f"error: invalid tool arguments: {exc}"
                             args = {}
                         else:
                             if on_tool:
                                 on_tool(name, args)
                             result = self.registry.execute(name, args)
+                            if on_status:
+                                on_status("result: " + result.split("\n", 1)[0][:160])
                     self.messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+                self.registry.cancel_stream_write()
                 self.sessions.save(self.session_id, self.messages)
             final = f"Stopped after {max_steps} tool steps. Ask me to continue if needed."
             self.messages.append({"role": "assistant", "content": final})
             self.sessions.save(self.session_id, self.messages)
             return final
-        except Exception:
+        except BaseException:
+            self.registry.cancel_stream_write()
             self.sessions.save(self.session_id, self.messages)
             raise
 

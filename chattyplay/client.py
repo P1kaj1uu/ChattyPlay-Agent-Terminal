@@ -22,6 +22,7 @@ class OpenAIClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         on_text: Callable[[str], None] | None = None,
+        on_tool_delta: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         env_name = self.provider["api_key_env"]
         api_key = os.environ.get(env_name, "") if env_name else ""
@@ -67,7 +68,7 @@ class OpenAIClient:
                         on_text(text)
                     message["_usage"] = data.get("usage") or {}
                     return message
-                return self._read_stream(response, on_text)
+                return self._read_stream(response, on_text, on_tool_delta)
         except urllib.error.HTTPError as exc:
             detail = exc.read(4000).decode("utf-8", errors="replace")
             raise ModelError(f"Model API returned HTTP {exc.code}: {detail}") from exc
@@ -75,7 +76,11 @@ class OpenAIClient:
             raise ModelError(f"Cannot reach model API: {exc.reason}") from exc
 
     @staticmethod
-    def _read_stream(response: Any, on_text: Callable[[str], None] | None) -> dict[str, Any]:
+    def _read_stream(
+        response: Any,
+        on_text: Callable[[str], None] | None,
+        on_tool_delta: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         content: list[str] = []
         reasoning: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
@@ -109,6 +114,8 @@ class OpenAIClient:
                 function = part.get("function") or {}
                 call["function"]["name"] += function.get("name") or ""
                 call["function"]["arguments"] += function.get("arguments") or ""
+                if on_tool_delta:
+                    on_tool_delta(call["function"]["name"], call["function"]["arguments"])
         message: dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
         if reasoning:
             message["reasoning_content"] = "".join(reasoning)
@@ -130,6 +137,7 @@ class AnthropicClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         on_text: Callable[[str], None] | None = None,
+        on_tool_delta: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         env_name = self.provider["api_key_env"]
         api_key = os.environ.get(env_name, "") if env_name else ""
@@ -162,7 +170,7 @@ class AnthropicClient:
             with urllib.request.urlopen(request, timeout=600) as response:
                 if "text/event-stream" not in response.headers.get("Content-Type", ""):
                     return self._response(json.loads(response.read().decode("utf-8")), on_text)
-                return self._read_stream(response, on_text)
+                return self._read_stream(response, on_text, on_tool_delta)
         except urllib.error.HTTPError as exc:
             detail = exc.read(4000).decode("utf-8", errors="replace")
             raise ModelError(f"Model API returned HTTP {exc.code}: {detail}") from exc
@@ -235,7 +243,11 @@ class AnthropicClient:
         return message
 
     @staticmethod
-    def _read_stream(response: Any, on_text: Callable[[str], None] | None) -> dict[str, Any]:
+    def _read_stream(
+        response: Any,
+        on_text: Callable[[str], None] | None,
+        on_tool_delta: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         texts: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] = {}
@@ -266,7 +278,10 @@ class AnthropicClient:
                     if text and on_text:
                         on_text(text)
                 elif delta.get("type") == "input_json_delta":
-                    calls.setdefault(int(event.get("index", 0)), {"id": "", "name": "", "arguments": ""})["arguments"] += delta.get("partial_json", "")
+                    call = calls.setdefault(int(event.get("index", 0)), {"id": "", "name": "", "arguments": ""})
+                    call["arguments"] += delta.get("partial_json", "")
+                    if on_tool_delta:
+                        on_tool_delta(call["name"], call["arguments"])
         message: dict[str, Any] = {"role": "assistant", "content": "".join(texts) or None}
         if calls:
             message["tool_calls"] = [

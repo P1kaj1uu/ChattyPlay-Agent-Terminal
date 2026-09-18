@@ -117,10 +117,14 @@ class Spinner:
         self._stream_started = 0.0
         self._stream_text = ""
         self._meter_visible = False
+        self._line_open = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        if self._line_open:
+            self.stream.write("\n")
+            self._line_open = False
         self._phase_started = time.monotonic()
         self._stream_started = 0.0
         self._stream_text = ""
@@ -145,7 +149,7 @@ class Spinner:
         self._stream_started = self._stream_started or now
         self._stream_text += text
         self.stream.write(prefix + text)
-        self._render_meter(now)
+        self._line_open = not text.endswith("\n")
         self.stream.flush()
 
     def finish(self, output_tokens: int = 0) -> None:
@@ -185,8 +189,15 @@ class Spinner:
                 return
             elapsed = int(time.monotonic() - self._phase_started)
             label = self.text if elapsed < 2 else f"{self.text} {elapsed}s · Ctrl+C to cancel"
-            self._rendered_width = max(self._rendered_width, get_cwidth(label) + 2)
-            self.stream.write(f"\r{self.style}{symbol} {label}{self.reset}")
+            width = max(1, shutil.get_terminal_size((80, 24)).columns - 3)
+            clipped = ""
+            for char in label:
+                if get_cwidth(clipped + char) > width:
+                    break
+                if char.isprintable():
+                    clipped += char
+            self._rendered_width = get_cwidth(clipped) + 2
+            self.stream.write(f"\r\033[2K{self.style}{symbol} {clipped}{self.reset}")
             self.stream.flush()
             if self._stop.wait(0.1):
                 return

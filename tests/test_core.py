@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import hashlib
+import os
 import re
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from prompt_toolkit.utils import get_cwidth
 from chattyplay.config import ConfigStore
 from chattyplay.client import AnthropicClient, OpenAIClient, create_client
 from chattyplay.cli import _format_shell_result, _is_command, _reload_agent
-from chattyplay.agent import Agent
+from chattyplay.agent import Agent, _tool_status
 from chattyplay.sessions import SessionStore
 from chattyplay.mcp import MCPManager
 from chattyplay.rag import RAGIndex
@@ -82,7 +83,7 @@ class CoreTests(unittest.TestCase):
         spinner._phase_started = spinner._stream_started = time.monotonic() - 2
         spinner.write("你好", "agent ❯ ")
         spinner.finish(20)
-        self.assertIn("thinking... 2.0s · ~1.0 tok/s", streamed.getvalue())
+        self.assertNotIn("\033[s", streamed.getvalue())
         self.assertIn("10.0 tok/s", streamed.getvalue())
         self.assertNotIn("n/a", streamed.getvalue())
 
@@ -106,6 +107,63 @@ class CoreTests(unittest.TestCase):
         self.assertIn("reverted 5", tools.undo(checkpoint))
         self.assertFalse((self.root / "src" / "a.py").exists())
         self.assertFalse((self.root / "src" / "b.py").exists())
+
+    def test_file_write_retries_transient_windows_lock_without_fsync(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        real_replace = os.replace
+        attempts = 0
+
+        def replace(source: Path, destination: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError("file is temporarily in use")
+            real_replace(source, destination)
+
+        with patch("chattyplay.tools.os.replace", side_effect=replace), patch("chattyplay.tools.os.fsync") as fsync, patch("chattyplay.tools.time.sleep"):
+            self.assertIn("ok: wrote", tools.execute("write_file", {"path": "locked.txt", "content": "done"}))
+
+        self.assertEqual(attempts, 3)
+        fsync.assert_not_called()
+        self.assertEqual((self.root / "locked.txt").read_text(), "done")
+
+    def test_file_content_is_written_while_tool_arguments_stream(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        self.assertTrue(tools.stream_write('{"path":"live.txt","content":"first\\n'))
+        self.assertEqual((self.root / "live.txt").read_text(), "first\n")
+        arguments = '{"path":"live.txt","content":"first\\nsecond"}'
+        self.assertTrue(tools.stream_write(arguments))
+        self.assertEqual((self.root / "live.txt").read_text(), "first\nsecond")
+        self.assertIn("ok: wrote", tools.execute("write_file", json.loads(arguments)))
+
+        (self.root / "live.txt").write_text("original")
+        tools.stream_write('{"path":"live.txt","content":"partial')
+        self.assertEqual((self.root / "live.txt").read_text(), "partial")
+        tools.cancel_stream_write()
+        self.assertEqual((self.root / "live.txt").read_text(), "original")
+
+    def test_create_file_exists_before_generation_and_grows_between_chunks(self) -> None:
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["permissions"]["write"] = "allow"
+        agent = Agent(self.root, config)
+        target = self.root / "generated.txt"
+        class Generator:
+            def complete(inner, messages, tools, on_text):
+                self.assertEqual(target.read_bytes(), b"")
+                self.assertEqual(tools, [])
+                on_text("first\n")
+                self.assertEqual(target.read_bytes(), b"first\n")
+                on_text("second\n")
+                self.assertEqual(target.read_bytes(), b"first\nsecond\n")
+                return {"role": "assistant", "content": "first\nsecond\n"}
+        agent.client = Generator()
+        try:
+            self.assertIn("ok: created", agent.registry.execute("create_file", {"path": "generated.txt", "instructions": "Write two lines"}))
+            self.assertIn("FileExistsError", agent.registry.execute("create_file", {"path": "generated.txt", "instructions": "Replace"}))
+            self.assertIn("reverted 1", agent.registry.undo(0))
+            self.assertFalse(target.exists())
+        finally:
+            agent.close()
 
     def test_permissions_and_hard_deny(self) -> None:
         tools = ToolRegistry(self.root, {"shell": "allow"})
@@ -199,11 +257,14 @@ class CoreTests(unittest.TestCase):
             {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 4}},
         ]
         stream = io.BytesIO("".join(f"data: {json.dumps(e)}\n\n" for e in events).encode() + b"data: [DONE]\n\n")
-        message = OpenAIClient._read_stream(stream, None)
+        progress: list[tuple[str, str]] = []
+        message = OpenAIClient._read_stream(stream, None, lambda name, args: progress.append((name, args)))
         call = message["tool_calls"][0]
         self.assertEqual(call["function"]["name"], "write_file")
         self.assertEqual(json.loads(call["function"]["arguments"])["path"], "a.txt")
         self.assertEqual(message["_usage"]["prompt_tokens"], 10)
+        self.assertEqual(progress[-1], ("write_file", '{"path":"a.txt","content":"ok"}'))
+        self.assertEqual(_tool_status(*progress[-1]), "writing a.txt · 31 chars...")
 
     def test_openai_reasoning_options_are_only_sent_when_enabled(self) -> None:
         response = io.BytesIO(b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}')
@@ -245,8 +306,10 @@ class CoreTests(unittest.TestCase):
             {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a\"}"}},
         ]
         stream = io.BytesIO("".join(f"data: {json.dumps(e)}\n\n" for e in events).encode())
-        call = AnthropicClient._read_stream(stream, None)["tool_calls"][0]
+        progress: list[tuple[str, str]] = []
+        call = AnthropicClient._read_stream(stream, None, lambda name, args: progress.append((name, args)))["tool_calls"][0]
         self.assertEqual(json.loads(call["function"]["arguments"]), {"path": "a"})
+        self.assertEqual(progress, [("read_file", '{"path":"a"}')])
         self.assertIsInstance(create_client({"api_style": "anthropic"}), AnthropicClient)
 
     def test_stdio_mcp_tool_registration_and_call(self) -> None:
@@ -299,7 +362,7 @@ class CoreTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.source = ""
 
-            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None, on_tool_delta=None) -> dict:
                 self.source = messages[-1]["content"]
                 return {"role": "assistant", "content": "old work summary"}
 
@@ -329,7 +392,7 @@ class CoreTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.source = ""
 
-            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None, on_tool_delta=None) -> dict:
                 self.source = messages[-1]["content"]
                 return {"role": "assistant", "content": "summary"}
 
@@ -355,7 +418,7 @@ class CoreTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.requests: list[list[dict]] = []
 
-            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None, on_tool_delta=None) -> dict:
                 self.requests.append(messages)
                 return {"role": "assistant", "content": "first answer" if len(self.requests) == 1 else "second answer"}
 
@@ -376,7 +439,7 @@ class CoreTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.schemas: list[list[dict]] = []
 
-            def complete(self, messages: list[dict], tools: list[dict], on_text=None) -> dict:
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None, on_tool_delta=None) -> dict:
                 self.schemas.append(tools)
                 if len(self.schemas) == 1:
                     return {"role": "assistant", "content": None, "tool_calls": [{"id": "gate", "function": {"name": "activate_tools", "arguments": "{}"}}]}

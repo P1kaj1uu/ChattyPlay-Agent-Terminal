@@ -434,15 +434,43 @@ def interactive(workspace: Path, store: ConfigStore, yes: bool = False, resume_i
             print(f"{YELLOW}unknown command; use /help{RESET}"); continue
         spinner = Spinner(style=DIM, reset=RESET)
         printed = False
+        file_path = ""
+        file_content = ""
+        def on_file(path: str, content: str) -> None:
+            nonlocal file_path, file_content
+            if path != file_path or not content.startswith(file_content):
+                spinner.stop()
+                print(f"\n{CYAN}  {path!r} · generating{RESET}")
+                file_path, file_content = path, ""
+            delta = content[len(file_content):]
+            if delta:
+                # Keep model-generated escape sequences out of terminal control flow.
+                spinner.write("".join(c for c in delta if c.isprintable() or c in "\n\t"))
+                file_content = content
         def on_text(text: str) -> None:
             nonlocal printed
             spinner.write(text, f"{GREEN}agent ❯ {RESET}" if not printed else "")
             printed = True
         def on_tool(name: str, args: dict[str, Any]) -> None:
             spinner.stop()
-            print(f"\n{DIM}  → {name} {json.dumps(args, ensure_ascii=False)[:180]}{RESET}")
+            preview = {key: f"<{len(value):,} chars>" if key in {"content", "old_text", "new_text"} and isinstance(value, str) else value for key, value in args.items()}
+            print(f"\n{DIM}  → {name} {json.dumps(preview, ensure_ascii=False)[:180]}{RESET}")
+        def on_status(status: str) -> None:
+            nonlocal file_path, file_content
+            if status.startswith("result: "):
+                spinner.stop()
+                print(f"\n{DIM}  {status[8:]}{RESET}", flush=True)
+                file_path, file_content = "", ""
+                return
+            if not status:
+                spinner.stop()
+                return
+            if file_path and status.startswith(("writing ", "editing ")):
+                return
+            spinner.text = status
+            spinner.start()
         try:
-            answer = agent.run(prompt, on_text, on_tool, lambda _: spinner.start())
+            answer = agent.run(prompt, on_text, on_tool, on_status, on_file)
             if not printed and answer:
                 print(f"{GREEN}agent ❯ {RESET}{answer}", end="")
             spinner.finish(agent.last_output_tokens)

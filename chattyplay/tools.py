@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
@@ -83,6 +84,16 @@ class Change:
     before_mode: int | None = None
 
 
+@dataclass
+class StreamingWrite:
+    raw_path: str
+    path: Path
+    before: bytes | None
+    before_mode: int | None
+    handle: Any = None
+    content: str = ""
+
+
 class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -121,6 +132,8 @@ class ToolRegistry:
         self.tools: dict[str, Tool] = {}
         self.always_allowed: set[str] = set()
         self.changes: list[Change] = []
+        self._stream_write: StreamingWrite | None = None
+        self._stream_denied: str | None = None
         self.plan_mode = False
         self.plan: list[dict[str, Any]] = []
         self._register_builtin()
@@ -161,8 +174,12 @@ class ToolRegistry:
             return "error: command blocked by hard safety rule"
         if self.plan_mode and tool.category in {"write", "shell", "browser", "clipboard", "mcp"}:
             return f"error: {name} is unavailable in plan mode"
+        streamed = name == "write_file" and self._stream_write is not None and args.get("path") == self._stream_write.raw_path
+        if name == "write_file" and args.get("path") == self._stream_denied:
+            self._stream_denied = None
+            return "error: user denied permission"
         policy = self.permissions.get(tool.category, "ask")
-        if tool.category not in self.always_allowed:
+        if not streamed and tool.category not in self.always_allowed:
             if policy == "deny":
                 return f"error: {tool.category} permission denied"
             if policy == "ask":
@@ -203,7 +220,7 @@ class ToolRegistry:
             "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": 2000}},
             "required": ["path"],
         }, "read", self._read))
-        self.add(Tool("write_file", "Atomically create or replace a UTF-8 text file. Pass the SHA-256 from read_file when overwriting to reject stale writes.", {
+        self.add(Tool("write_file", "Atomically create or fully replace a UTF-8 text file. Prefer edit_file for targeted changes. Pass the SHA-256 from read_file when overwriting to reject stale writes.", {
             **obj, "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "expected_sha256": {"type": "string"}}, "required": ["path", "content"]
         }, "write", self._write))
         self.add(Tool("edit_file", "Replace an exact, unique string in a file. Read first and pass expected_sha256 to reject stale edits.", {
@@ -261,18 +278,95 @@ class ToolRegistry:
         path = self._path(args["path"])
         if path.exists() and not path.is_file():
             raise IsADirectoryError(path)
-        before = path.read_bytes() if path.exists() and path.is_file() else None
-        before_mode = path.stat().st_mode & 0o7777 if before is not None else None
+        streaming = self._stream_write if self._stream_write and self._stream_write.path == path else None
+        if streaming and streaming.handle:
+            streaming.handle.close()
+        before = streaming.before if streaming else path.read_bytes() if path.exists() and path.is_file() else None
+        before_mode = streaming.before_mode if streaming else path.stat().st_mode & 0o7777 if before is not None else None
         after = str(args["content"]).encode("utf-8")
         expected = args.get("expected_sha256")
         actual = hashlib.sha256(before).hexdigest() if before is not None else "missing"
         if expected and str(expected) != actual:
+            self.cancel_stream_write()
             raise ValueError(f"stale file version: expected {expected}, current {actual}")
         if before == after:
+            if streaming and streaming.content.encode("utf-8") != after:
+                self._replace_bytes(path, after, before_mode)
+            self._stream_write = None
             return f"ok: unchanged {path.relative_to(self.workspace)}"
-        self._replace_bytes(path, after)
+        if not streaming or streaming.content.encode("utf-8") != after:
+            self._replace_bytes(path, after, before_mode)
+        self._stream_write = None
         self.changes.append(Change(path, before, after, before_mode))
         return f"ok: wrote {path.relative_to(self.workspace)}"
+
+    @staticmethod
+    def _partial_string(arguments: str, key: str, partial: bool = False) -> str | None:
+        match = re.search(rf'"{key}"\s*:\s*', arguments)
+        if not match or match.end() >= len(arguments) or arguments[match.end()] != '"':
+            return None
+        raw = arguments[match.end():]
+        try:
+            value, _ = json.JSONDecoder().raw_decode(raw)
+            return value if isinstance(value, str) else None
+        except json.JSONDecodeError:
+            if not partial:
+                return None
+        raw = raw[1:]
+        for cut in range(min(6, len(raw)) + 1):
+            try:
+                return json.loads('"' + (raw[:-cut] if cut else raw) + '"')
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    def stream_write(self, arguments: str, before_confirm: Callable[[], None] | None = None) -> bool:
+        raw_path = self._partial_string(arguments, "path")
+        if not raw_path or raw_path == self._stream_denied:
+            return False
+        if self._stream_write is None:
+            path = self._path(raw_path)
+            if path.exists() and not path.is_file():
+                return False
+            policy = self.permissions.get("write", "ask")
+            if "write" not in self.always_allowed and policy != "allow":
+                if policy == "deny":
+                    return False
+                if before_confirm:
+                    before_confirm()
+                decision = self.confirm("write", f"write_file({raw_path})") if self.confirm else False
+                if not decision:
+                    self._stream_denied = raw_path
+                    return False
+                if decision == "always":
+                    self.always_allowed.add("write")
+            before = path.read_bytes() if path.is_file() else None
+            mode = path.stat().st_mode & 0o7777 if before is not None else None
+            self._stream_write = StreamingWrite(raw_path, path, before, mode)
+        stream = self._stream_write
+        if stream.raw_path != raw_path:
+            return False  # ponytail: one streamed file at a time; batch writes still commit normally.
+        content = self._partial_string(arguments, "content", partial=True)
+        if content is None or not content.startswith(stream.content):
+            return True
+        if stream.handle is None:
+            stream.path.parent.mkdir(parents=True, exist_ok=True)
+            stream.handle = stream.path.open("wb")
+        stream.handle.write(content[len(stream.content):].encode("utf-8"))
+        stream.handle.flush()
+        stream.content = content
+        return True
+
+    def cancel_stream_write(self) -> None:
+        stream, self._stream_write = self._stream_write, None
+        if not stream:
+            return
+        if stream.handle:
+            stream.handle.close()
+        if stream.before is None:
+            stream.path.unlink(missing_ok=True)
+        else:
+            self._replace_bytes(stream.path, stream.before, stream.before_mode)
 
     def _edit(self, args: dict[str, Any]) -> str:
         path = self._path(args["path"])
@@ -332,13 +426,21 @@ class ToolRegistry:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
             if mode is not None:
                 temp.chmod(mode)
-            os.replace(temp, path)
+            for delay in (0.05, 0.1, 0.2, None):
+                try:
+                    os.replace(temp, path)
+                    break
+                except PermissionError:
+                    if delay is None:
+                        raise
+                    time.sleep(delay)
         finally:
-            temp.unlink(missing_ok=True)
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _glob(self, args: dict[str, Any]) -> str:
         pattern = str(args["pattern"])
