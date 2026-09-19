@@ -6,10 +6,14 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -24,6 +28,15 @@ HARD_DENY = re.compile(
     r"shutdown|reboot|diskpart|dd\s+if=)|:\(\)\s*\{",
     re.IGNORECASE,
 )
+
+FETCH_TIMEOUT_SECONDS = 10
+FETCH_ATTEMPTS = 2
+FETCH_RETRY_DELAY_SECONDS = 0.25
+FETCH_MAX_BYTES = 1_000_000
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+DISCOVERY_TIMEOUT_SECONDS = 5
+DISCOVERY_MAX_CANDIDATES = 5
+DISCOVERY_VERIFY_BYTES = 4096
 
 
 def _clipboard_program() -> tuple[list[str], list[str]]:
@@ -94,23 +107,249 @@ class StreamingWrite:
     content: str = ""
 
 
+@dataclass
+class _HttpResponse:
+    url: str
+    status: int
+    content_type: str
+    charset: str
+    body: bytes
+    truncated: bool
+
+
 class _TextExtractor(HTMLParser):
+    _HIDDEN_TAGS = {"head", "script", "style", "noscript", "svg", "template", "nav", "footer", "aside", "form"}
+    _BREAK_TAGS = {
+        "address", "article", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption",
+        "figure", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main",
+        "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul",
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self.hidden = 0
         self.parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "noscript"}:
+        tag = tag.lower()
+        if tag in self._HIDDEN_TAGS:
             self.hidden += 1
+        elif not self.hidden and tag in self._BREAK_TAGS:
+            self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript"} and self.hidden:
+        tag = tag.lower()
+        if tag in self._HIDDEN_TAGS and self.hidden:
             self.hidden -= 1
+        elif not self.hidden and tag in self._BREAK_TAGS:
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
         if not self.hidden and data.strip():
-            self.parts.append(data.strip())
+            self.parts.append(re.sub(r"\s+", " ", data).strip())
+
+    def text(self) -> str:
+        lines: list[str] = []
+        for raw in " ".join(self.parts).splitlines():
+            line = re.sub(r"\s+", " ", raw).strip()
+            if not line or (lines and line == lines[-1]):
+                continue
+            lines.append(line)
+        return "\n".join(lines)
+
+
+class _DiscoveryExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title_parts: list[str] = []
+        self.in_title = False
+        self.base_href: str | None = None
+        self.links: list[str] = []
+        self.scripts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        values = {name.lower(): value for name, value in attrs if value is not None}
+        if tag == "title":
+            self.in_title = True
+        elif tag == "base" and not self.base_href and values.get("href"):
+            self.base_href = values["href"]
+        elif tag == "a" and values.get("href"):
+            self.links.append(values["href"])
+        elif tag == "link" and values.get("href"):
+            rel = {item.lower() for item in values.get("rel", "").split()}
+            if rel & {"canonical", "alternate"}:
+                self.links.append(values["href"])
+        elif tag == "script" and values.get("src"):
+            self.scripts.append(values["src"])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title and data.strip():
+            self.title_parts.append(data.strip())
+
+    @property
+    def title(self) -> str:
+        return re.sub(r"\s+", " ", " ".join(self.title_parts)).strip()
+
+
+def _normalize_http_url(raw: Any) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("URL must be a non-empty string")
+    value = raw.strip()
+    if value.startswith("<") or value.endswith(">"):
+        if not (value.startswith("<") and value.endswith(">") and value.count("<") == 1 and value.count(">") == 1):
+            raise ValueError("malformed HTTP(S) autolink")
+        value = value[1:-1].strip()
+    elif value.startswith("["):
+        match = re.fullmatch(r"\[(?:[^\\\]]|\\.)*\]\(([^\s]+)\)", value)
+        if not match:
+            raise ValueError("malformed Markdown HTTP(S) link")
+        value = match.group(1)
+    if any(character.isspace() for character in value):
+        raise ValueError("URL must be a plain HTTP(S) target, Markdown link, or autolink")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("malformed HTTP(S) URL") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        raise ValueError("only HTTP(S) URLs with a hostname are allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing credentials are not allowed")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, parsed.fragment))
+
+
+def _response_content_type(headers: Any) -> tuple[str, str]:
+    try:
+        content_type = headers.get_content_type().lower()
+        charset = headers.get_content_charset() or "utf-8"
+    except AttributeError:
+        raw = str(headers.get("Content-Type", "text/plain"))
+        content_type = raw.split(";", 1)[0].strip().lower() or "text/plain"
+        match = re.search(r"charset\s*=\s*['\"]?([^;'\"\s]+)", raw, re.IGNORECASE)
+        charset = match.group(1) if match else "utf-8"
+    return content_type, charset
+
+
+def _decode_response(body: bytes, charset: str) -> str:
+    try:
+        return body.decode(charset, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
+def _readable_html(text: str) -> str:
+    parser = _TextExtractor()
+    parser.feed(text)
+    parser.close()
+    return parser.text()
+
+
+def _content_quality_error(text: str) -> str | None:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) < 40:
+        return "page contained too little readable text"
+    lowered = compact.lower()
+    blocked_markers = (
+        "enable javascript", "javascript is required", "verify you are human", "access denied",
+        "checking your browser", "just a moment...", "sign in to continue", "log in to continue",
+    )
+    if len(compact) < 500 and any(marker in lowered for marker in blocked_markers):
+        return "page appears to be a JavaScript, verification, or access-block page"
+    return None
+
+
+def _request_url(
+    url: str,
+    *,
+    attempts: int = FETCH_ATTEMPTS,
+    timeout: int = FETCH_TIMEOUT_SECONDS,
+    max_bytes: int = FETCH_MAX_BYTES,
+) -> tuple[_HttpResponse | None, str | None]:
+    request_url, _ = urllib.parse.urldefrag(url)
+    request = urllib.request.Request(request_url, headers={"User-Agent": f"ChattyPlay/{__version__} (+local coding agent)"})
+    last_error = "request failed"
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read(max_bytes + 1)
+                truncated = len(body) > max_bytes
+                if truncated:
+                    body = body[:max_bytes]
+                content_type, charset = _response_content_type(response.headers)
+                final_url = response.geturl() if hasattr(response, "geturl") else response.url
+                return _HttpResponse(
+                    final_url,
+                    getattr(response, "status", 200),
+                    content_type,
+                    charset,
+                    body,
+                    truncated,
+                ), None
+        except urllib.error.HTTPError as exc:
+            last_error = f"HTTP {exc.code}: {exc.reason}"
+            exc.close()
+            if exc.code not in RETRYABLE_HTTP_STATUS:
+                return None, f"{last_error} (not retryable)"
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionResetError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            last_error = f"{type(reason).__name__}: {reason}"
+        if attempt + 1 < attempts:
+            time.sleep(FETCH_RETRY_DELAY_SECONDS)
+    return None, f"unable to fetch URL after {attempts} attempts: {last_error}"
+
+
+def _same_origin(left: str, right: str) -> bool:
+    a, b = urllib.parse.urlsplit(left), urllib.parse.urlsplit(right)
+    return (a.scheme.lower(), a.hostname, a.port) == (b.scheme.lower(), b.hostname, b.port)
+
+
+def _discovery_metadata(html: str, page_url: str, requested_url: str, limit: int) -> tuple[str, str | None, list[str]]:
+    parser = _DiscoveryExtractor()
+    parser.feed(html)
+    parser.close()
+    base_url = urllib.parse.urljoin(page_url, parser.base_href) if parser.base_href else page_url
+    if not _same_origin(page_url, base_url):
+        base_url = page_url
+    candidates: list[str] = []
+
+    def add(raw: str) -> None:
+        if len(candidates) >= limit:
+            return
+        try:
+            candidate = _normalize_http_url(urllib.parse.urljoin(base_url, raw))
+        except ValueError:
+            return
+        candidate, _ = urllib.parse.urldefrag(candidate)
+        page_without_fragment, _ = urllib.parse.urldefrag(page_url)
+        if not _same_origin(page_url, candidate) or candidate == page_without_fragment or candidate in candidates:
+            return
+        candidates.append(candidate)
+
+    for link in parser.links:
+        add(link)
+
+    docsify = "window.$docsify" in html or any("docsify" in script.lower() for script in parser.scripts)
+    framework = "docsify" if docsify else None
+    if docsify:
+        homepage = re.search(r"\bhomepage\s*:\s*(['\"])([^'\"]+)\1", html)
+        fragment = urllib.parse.urlsplit(requested_url).fragment
+        route = urllib.parse.unquote(fragment[1:] if fragment.startswith("/") else fragment).strip("/")
+        if homepage:
+            add(homepage.group(2))
+        elif route and ".." not in route.split("/"):
+            add(route if Path(route).suffix else f"{route}.md")
+        else:
+            add("README.md")
+        sidebar = re.search(r"\bloadSidebar\s*:\s*(?:(['\"])([^'\"]+)\1|(true))", html, re.IGNORECASE)
+        if sidebar:
+            add(sidebar.group(2) or "_sidebar.md")
+    return parser.title, framework, candidates
 
 
 class ToolRegistry:
@@ -226,7 +465,7 @@ class ToolRegistry:
         self.add(Tool("edit_file", "Replace an exact, unique string in a file. Read first and pass expected_sha256 to reject stale edits.", {
             **obj, "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_sha256": {"type": "string"}}, "required": ["path", "old_text", "new_text"]
         }, "write", self._edit))
-        self.add(Tool("move_file", "Move one file within the workspace. The destination must not exist and the move can be reverted with /undo.", {
+        self.add(Tool("move_file", "Rename or move an existing file within the workspace without reading or rebuilding its contents. It supports case-only renames, never overwrites a different destination, and must not be simulated with create/write/delete tools if it fails. Contents and permissions are preserved, and a successful move can be reverted with /undo.", {
             **obj, "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}, "required": ["source", "destination"]
         }, "write", self._move))
         self.add(Tool("delete_file", "Delete one file inside the workspace. The deletion can be reverted with /undo.", {
@@ -241,12 +480,17 @@ class ToolRegistry:
         self.add(Tool("shell", "Run a shell command in the workspace. Use PowerShell/cmd syntax on Windows and shell syntax on macOS/Linux.", {
             **obj, "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 600}}, "required": ["command"]
         }, "shell", self._shell))
-        self.add(Tool("open_browser", "Open an HTTP(S) URL in the user's default browser.", {
+        self.add(Tool("open_browser", "Open an HTTP(S) URL in the user's default browser. Accepts a plain URL, a complete Markdown link, or an autolink.", {
             **obj, "properties": {"url": {"type": "string"}}, "required": ["url"]
         }, "browser", self._browser))
-        self.add(Tool("fetch_url", "Fetch an HTTP(S) page and return readable text. Use for web research and documentation.", {
+        self.add(Tool("fetch_url", "Fetch an HTTP(S) page and return readable text. Accepts a plain URL, a complete Markdown link, or an autolink. Use discover_url if a page reports too little readable content or a JavaScript app shell.", {
             **obj, "properties": {"url": {"type": "string"}}, "required": ["url"]
         }, "browser", self._fetch))
+        self.add(Tool("discover_url", "Find a small, verified set of content URLs evidenced by an HTML page, including documented SPA resources. Use after fetch_url reports too little readable content; candidates are leads and must be fetched before answering.", {
+            **obj,
+            "properties": {"url": {"type": "string"}, "max_candidates": {"type": "integer", "minimum": 1, "maximum": DISCOVERY_MAX_CANDIDATES}},
+            "required": ["url"],
+        }, "browser", self._discover))
         self.add(Tool("read_clipboard", "Read text from the local system clipboard on macOS, Windows, or Linux.", {
             **obj, "properties": {}
         }, "clipboard", lambda _: read_clipboard()))
@@ -393,18 +637,46 @@ class ToolRegistry:
         destination = self._path(args["destination"])
         if not source.is_file():
             raise FileNotFoundError(source)
-        if destination.exists():
-            raise FileExistsError(destination)
+        if source == destination:
+            return f"ok: unchanged {source.relative_to(self.workspace)}"
+        case_only = self._is_case_only_rename(source, destination)
+        if destination.exists() and not case_only:
+            raise FileExistsError(f"destination already exists: {destination}")
         content = source.read_bytes()
         mode = source.stat().st_mode & 0o7777
-        self._replace_bytes(destination, content, mode)
-        try:
-            source.unlink()
-        except Exception:
-            destination.unlink(missing_ok=True)
-            raise
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if case_only:
+            temporary = source.with_name(f".{source.name}.{uuid.uuid4().hex}.rename")
+            while temporary.exists():
+                temporary = source.with_name(f".{source.name}.{uuid.uuid4().hex}.rename")
+            os.rename(source, temporary)
+            try:
+                os.rename(temporary, destination)
+            except Exception as rename_error:
+                try:
+                    os.rename(temporary, source)
+                except Exception as recovery_error:
+                    raise RuntimeError(
+                        f"case-only rename failed: {rename_error}; recovery failed: {recovery_error}; "
+                        f"file may remain at {temporary}"
+                    ) from rename_error
+                raise OSError(f"case-only rename failed; source restored: {rename_error}") from rename_error
+        else:
+            os.rename(source, destination)
         self.changes.extend((Change(destination, None, content), Change(source, content, None, mode)))
         return f"ok: moved {source.relative_to(self.workspace)} to {destination.relative_to(self.workspace)}"
+
+    @staticmethod
+    def _is_case_only_rename(source: Path, destination: Path) -> bool:
+        if source.parent != destination.parent or source.name == destination.name or source.name.casefold() != destination.name.casefold():
+            return False
+        try:
+            names = {entry.name for entry in source.parent.iterdir()}
+            if source.name in names and destination.name in names:
+                return False
+            return destination.exists() and os.path.samefile(source, destination)
+        except OSError:
+            return False
 
     def _delete(self, args: dict[str, Any]) -> str:
         path = self._path(args["path"])
@@ -478,32 +750,79 @@ class ToolRegistry:
 
     @staticmethod
     def _browser(args: dict[str, Any]) -> str:
-        url = str(args["url"])
-        if not url.startswith(("http://", "https://")):
-            raise ValueError("only HTTP(S) URLs are allowed")
+        url = _normalize_http_url(args["url"])
         return "ok: opened" if webbrowser.open(url) else "error: browser could not be opened"
 
     @staticmethod
     def _fetch(args: dict[str, Any]) -> str:
-        url = str(args["url"])
-        if not url.startswith(("http://", "https://")):
-            raise ValueError("only HTTP(S) URLs are allowed")
-        request = urllib.request.Request(url, headers={"User-Agent": f"ChattyPlay/{__version__} (+local coding agent)"})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read(1_000_001)
-            if len(body) > 1_000_000:
-                body = body[:1_000_000]
-                suffix = "\n... response truncated at 1 MB"
+        url = _normalize_http_url(args["url"])
+        response, error = _request_url(url)
+        if response is None:
+            return f"error: {error}\nURL: {url}"
+        if response.content_type in {"text/html", "application/xhtml+xml"}:
+            html = _decode_response(response.body, response.charset)
+            text = _readable_html(html)
+            quality_error = _content_quality_error(text)
+            if quality_error:
+                title, framework, candidates = _discovery_metadata(
+                    html, response.url, url, DISCOVERY_MAX_CANDIDATES,
+                )
+                metadata = []
+                if title:
+                    metadata.append(f"Title (metadata only): {title}")
+                if framework:
+                    metadata.append(f"Detected framework: {framework}")
+                if candidates:
+                    metadata.append("Discovery candidates: " + ", ".join(candidates))
+                suffix = "\n" + "\n".join(metadata) if metadata else ""
+                return (
+                    f"error: unable to read this page reliably: {quality_error}\n"
+                    f"URL: {response.url}\nStatus: {response.status}\nContent-Type: {response.content_type}{suffix}"
+                )
+        elif response.content_type.startswith("text/") or response.content_type in {
+            "application/json", "application/xml",
+        }:
+            text = _decode_response(response.body, response.charset)
+        else:
+            return (
+                f"error: unsupported Content-Type: {response.content_type}\n"
+                f"URL: {response.url}\nStatus: {response.status}\nContent-Type: {response.content_type}"
+            )
+        suffix = "\n... response truncated at 1 MB" if response.truncated else ""
+        return f"URL: {response.url}\nStatus: {response.status}\nContent-Type: {response.content_type}\n\n{text}{suffix}"
+
+    @staticmethod
+    def _discover(args: dict[str, Any]) -> str:
+        url = _normalize_http_url(args["url"])
+        limit = min(DISCOVERY_MAX_CANDIDATES, max(1, int(args.get("max_candidates", DISCOVERY_MAX_CANDIDATES))))
+        response, error = _request_url(url, attempts=1, timeout=DISCOVERY_TIMEOUT_SECONDS)
+        if response is None:
+            return f"error: unable to inspect page for content discovery: {error}\nURL: {url}"
+        if response.content_type not in {"text/html", "application/xhtml+xml"}:
+            return f"error: content discovery requires HTML, got {response.content_type}\nURL: {response.url}"
+        html = _decode_response(response.body, response.charset)
+        title, framework, candidates = _discovery_metadata(html, response.url, url, limit)
+        lines = [f"URL: {response.url}"]
+        if title:
+            lines.append(f"Title (metadata only): {title}")
+        if framework:
+            lines.append(f"Detected framework: {framework}")
+        if not candidates:
+            lines.append("no reliable content candidates found")
+            return "\n".join(lines)
+        lines.append("Candidates (fetch a verified URL before answering):")
+        for candidate in candidates:
+            check, check_error = _request_url(
+                candidate,
+                attempts=1,
+                timeout=DISCOVERY_TIMEOUT_SECONDS,
+                max_bytes=DISCOVERY_VERIFY_BYTES,
+            )
+            if check is None:
+                lines.append(f"- {candidate} [unverified: {check_error}]")
             else:
-                suffix = ""
-            content_type = response.headers.get_content_type()
-            charset = response.headers.get_content_charset() or "utf-8"
-            text = body.decode(charset, errors="replace")
-            if content_type == "text/html":
-                parser = _TextExtractor()
-                parser.feed(text)
-                text = "\n".join(parser.parts)
-            return f"URL: {response.url}\nStatus: {response.status}\nContent-Type: {content_type}\n\n{text}{suffix}"
+                lines.append(f"- {candidate} [verified: HTTP {check.status}, {check.content_type}]")
+        return "\n".join(lines)
 
     def _ask_user(self, args: dict[str, Any]) -> str:
         question = str(args["question"]).strip()

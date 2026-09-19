@@ -21,7 +21,7 @@ from prompt_toolkit.utils import get_cwidth
 from chattyplay.config import ConfigStore
 from chattyplay.client import AnthropicClient, OpenAIClient, create_client
 from chattyplay.cli import _format_shell_result, _is_command, _reload_agent
-from chattyplay.agent import Agent, _tool_status
+from chattyplay.agent import Agent, BASE_PROMPT, _tool_status
 from chattyplay.sessions import SessionStore
 from chattyplay.mcp import MCPManager
 from chattyplay.rag import RAGIndex
@@ -101,12 +101,120 @@ class CoreTests(unittest.TestCase):
         self.assertIn("stale file version", tools.execute("edit_file", {"path": "src/a.py", "old_text": "2", "new_text": "3", "expected_sha256": version}))
         self.assertIn("ok: moved", tools.execute("move_file", {"source": "src/a.py", "destination": "src/b.py"}))
         self.assertEqual((self.root / "src" / "b.py").stat().st_mode & 0o777, 0o755)
-        self.assertIn("FileExistsError", tools.execute("move_file", {"source": "src/b.py", "destination": "src/b.py"}))
+        changes_before_noop = len(tools.changes)
+        self.assertIn("ok: unchanged", tools.execute("move_file", {"source": "src/b.py", "destination": "src/b.py"}))
+        self.assertEqual(len(tools.changes), changes_before_noop)
         self.assertIn("ok: deleted", tools.execute("delete_file", {"path": "src/b.py"}))
         self.assertIn("outside workspace", tools.execute("read_file", {"path": "../secret"}))
         self.assertIn("reverted 5", tools.undo(checkpoint))
         self.assertFalse((self.root / "src" / "a.py").exists())
         self.assertFalse((self.root / "src" / "b.py").exists())
+
+    def test_move_file_renames_without_rewriting_and_creates_parent(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        source = self.root / "source.bin"
+        destination = self.root / "nested" / "renamed.bin"
+        content = b"\x00rename me\xff"
+        source.write_bytes(content)
+        source.chmod(0o755)
+
+        with patch.object(tools, "_replace_bytes") as replace_bytes:
+            result = tools.execute("move_file", {"source": "source.bin", "destination": "nested/renamed.bin"})
+
+        self.assertIn("ok: moved", result)
+        replace_bytes.assert_not_called()
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), content)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+
+    def test_move_file_rejects_existing_missing_and_outside_paths(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        source = self.root / "source.txt"
+        destination = self.root / "destination.txt"
+        source.write_text("source")
+        destination.write_text("destination")
+
+        self.assertIn("FileExistsError", tools.execute("move_file", {"source": "source.txt", "destination": "destination.txt"}))
+        self.assertEqual(source.read_text(), "source")
+        self.assertEqual(destination.read_text(), "destination")
+        self.assertIn("FileNotFoundError", tools.execute("move_file", {"source": "missing.txt", "destination": "new.txt"}))
+        self.assertFalse((self.root / "new.txt").exists())
+        self.assertIn("outside workspace", tools.execute("move_file", {"source": "../outside.txt", "destination": "inside.txt"}))
+        self.assertIn("outside workspace", tools.execute("move_file", {"source": "source.txt", "destination": "../outside.txt"}))
+        self.assertTrue(source.exists())
+
+    def test_move_file_undo_restores_path_content_and_mode(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        source = self.root / "before.sh"
+        destination = self.root / "after.sh"
+        content = b"#!/bin/sh\necho moved\n"
+        source.write_bytes(content)
+        source.chmod(0o755)
+
+        self.assertIn("ok: moved", tools.execute("move_file", {"source": "before.sh", "destination": "after.sh"}))
+        self.assertIn("reverted 2", tools.undo(0))
+        self.assertTrue(source.exists())
+        self.assertEqual(source.read_bytes(), content)
+        self.assertEqual(source.stat().st_mode & 0o777, 0o755)
+        self.assertFalse(destination.exists())
+
+    def test_move_file_rename_failure_leaves_source_untouched(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        source = self.root / "source.txt"
+        destination = self.root / "nested" / "destination.txt"
+        source.write_text("unchanged")
+
+        with patch("chattyplay.tools.os.rename", side_effect=OSError("rename failed")):
+            result = tools.execute("move_file", {"source": "source.txt", "destination": "nested/destination.txt"})
+
+        self.assertIn("rename failed", result)
+        self.assertEqual(source.read_text(), "unchanged")
+        self.assertFalse(destination.exists())
+
+    def test_move_file_case_only_rename_uses_temporary_path(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        source = self.root / "name.txt"
+        destination = self.root / "Name.txt"
+        source.write_text("same file")
+
+        with patch.object(tools, "_is_case_only_rename", return_value=True), patch("chattyplay.tools.os.rename") as rename:
+            result = tools.execute("move_file", {"source": "name.txt", "destination": "Name.txt"})
+
+        self.assertIn("ok: moved", result)
+        self.assertEqual(rename.call_count, 2)
+        first_source, temporary = rename.call_args_list[0].args
+        second_temporary, final_destination = rename.call_args_list[1].args
+        self.assertEqual(first_source, source.resolve())
+        self.assertEqual(second_temporary, temporary)
+        self.assertEqual(temporary.parent, source.resolve().parent)
+        self.assertNotIn(temporary, {source.resolve(), destination.resolve()})
+        self.assertEqual(final_destination, destination.resolve())
+        self.assertEqual(len(tools.changes), 2)
+
+    def test_move_file_case_only_failure_rolls_back_or_reports_recovery_path(self) -> None:
+        tools = ToolRegistry(self.root, {"write": "allow"})
+        source = self.root / "name.txt"
+        destination = self.root / "Name.txt"
+        source.write_text("same file")
+
+        with patch.object(tools, "_is_case_only_rename", return_value=True), patch(
+            "chattyplay.tools.os.rename", side_effect=[None, PermissionError("locked"), None],
+        ) as rename:
+            result = tools.execute("move_file", {"source": "name.txt", "destination": "Name.txt"})
+        self.assertIn("source restored", result)
+        self.assertEqual(rename.call_count, 3)
+        self.assertEqual(rename.call_args_list[2].args[1], source.resolve())
+        self.assertEqual(tools.changes, [])
+
+        with patch.object(tools, "_is_case_only_rename", return_value=True), patch(
+            "chattyplay.tools.os.rename",
+            side_effect=[None, PermissionError("locked"), PermissionError("rollback locked")],
+        ) as rename:
+            result = tools.execute("move_file", {"source": "name.txt", "destination": "Name.txt"})
+        self.assertIn("recovery failed", result)
+        self.assertIn("file may remain at", result)
+        self.assertEqual(rename.call_count, 3)
+        self.assertEqual(tools.changes, [])
 
     def test_file_write_retries_transient_windows_lock_without_fsync(self) -> None:
         tools = ToolRegistry(self.root, {"write": "allow"})
@@ -250,6 +358,297 @@ class CoreTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_fetch_url_extracts_readable_html_and_reports_final_url(self) -> None:
+        class Headers:
+            def get_content_type(self) -> str:
+                return "text/html"
+
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response(io.BytesIO):
+            headers = Headers()
+            status = 200
+            url = "https://example.test/final"
+
+            def geturl(self) -> str:
+                return self.url
+
+        html = b"""<html><head><style>hidden css</style></head><body>
+            <nav>navigation noise</nav><header><h1>Useful title</h1></header>
+            <main><p>This is the useful article body with enough detail to answer the user's question reliably.</p>
+            <ul><li>First fact</li><li>Second fact</li></ul></main>
+            <footer>footer noise</footer><script>hidden script</script></body></html>"""
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response(html)):
+            result = tools.execute("fetch_url", {"url": "https://example.test/redirect"})
+        self.assertIn("URL: https://example.test/final", result)
+        self.assertIn("Useful title", result)
+        self.assertIn("First fact", result)
+        self.assertNotIn("navigation noise", result)
+        self.assertNotIn("footer noise", result)
+        self.assertNotIn("hidden script", result)
+
+    def test_http_tools_normalize_complete_markdown_links_and_autolinks(self) -> None:
+        class Headers:
+            def get_content_type(self) -> str:
+                return "text/plain"
+
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response(io.BytesIO):
+            headers = Headers()
+            status = 200
+
+            def __init__(self, url: str) -> None:
+                super().__init__(b"verified page content")
+                self.url = url
+
+            def geturl(self) -> str:
+                return self.url
+
+        requested: list[str] = []
+
+        def open_url(request, timeout=0):
+            requested.append(request.full_url)
+            return Response(request.full_url)
+
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        with patch("chattyplay.tools.urllib.request.urlopen", side_effect=open_url):
+            tools.execute("fetch_url", {"url": "[Hello Agents](https://hello-agents.datawhale.cc/#/)"})
+            tools.execute("fetch_url", {"url": "<https://example.test/docs>"})
+        self.assertEqual(requested, ["https://hello-agents.datawhale.cc/", "https://example.test/docs"])
+
+        with patch("chattyplay.tools.webbrowser.open", return_value=True) as opened:
+            self.assertIn("ok: opened", tools.execute("open_browser", {"url": "[Docs (v2)](https://example.test/guide)"}))
+        opened.assert_called_once_with("https://example.test/guide")
+
+    def test_http_tools_reject_ambiguous_or_unsafe_url_values(self) -> None:
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        invalid = (
+            "please visit https://example.test/a",
+            "[bad](javascript:alert(1))",
+            "https:///missing-host",
+            "[one](https://one.test) [two](https://two.test)",
+        )
+        with patch("chattyplay.tools.urllib.request.urlopen") as request:
+            for value in invalid:
+                self.assertIn("error: ValueError", tools.execute("fetch_url", {"url": value}))
+        request.assert_not_called()
+
+    def test_discover_url_finds_docsify_content_from_page_evidence(self) -> None:
+        class Headers:
+            def __init__(self, content_type: str) -> None:
+                self.content_type = content_type
+
+            def get_content_type(self) -> str:
+                return self.content_type
+
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __init__(self, url: str, body: bytes, content_type: str) -> None:
+                super().__init__(body)
+                self.url = url
+                self.headers = Headers(content_type)
+
+            def geturl(self) -> str:
+                return self.url
+
+        shell = b"""<html><head><title>Hello Agents</title></head><body><div id=app></div>
+            <script>window.$docsify = {loadSidebar: true};</script>
+            <script src=\"https://cdn.example.test/docsify.min.js\"></script></body></html>"""
+        calls: list[str] = []
+
+        def open_url(request, timeout=0):
+            calls.append(request.full_url)
+            if request.full_url == "https://docs.example.test/":
+                return Response(request.full_url, shell, "text/html")
+            if request.full_url == "https://docs.example.test/README.md":
+                return Response(request.full_url, b"# Real content\nThis text came from the documented SPA resource.", "text/markdown")
+            raise AssertionError(f"unexpected request: {request.full_url}")
+
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        with patch("chattyplay.tools.urllib.request.urlopen", side_effect=open_url):
+            failed_fetch = tools.execute("fetch_url", {"url": "[Docs](https://docs.example.test/#/)"})
+            discovered = tools.execute("discover_url", {"url": "https://docs.example.test/#/", "max_candidates": 1})
+        self.assertIn("unable to read this page reliably", failed_fetch)
+        self.assertIn("Discovery candidates: https://docs.example.test/README.md", failed_fetch)
+        self.assertIn("Detected framework: docsify", discovered)
+        self.assertIn("https://docs.example.test/README.md [verified: HTTP 200, text/markdown]", discovered)
+        self.assertEqual(calls, [
+            "https://docs.example.test/",
+            "https://docs.example.test/",
+            "https://docs.example.test/README.md",
+        ])
+
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response(
+            "https://docs.example.test/README.md",
+            b"# Real content\nThis text came from the documented SPA resource.",
+            "text/markdown",
+        )):
+            fetched = tools.execute("fetch_url", {"url": "https://docs.example.test/README.md"})
+        self.assertIn("This text came from the documented SPA resource", fetched)
+
+    def test_discover_url_does_not_guess_from_title_and_limits_safe_candidates(self) -> None:
+        class Headers:
+            def get_content_type(self) -> str:
+                return "text/html"
+
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response(io.BytesIO):
+            headers = Headers()
+            status = 200
+
+            def __init__(self, url: str, body: bytes) -> None:
+                super().__init__(body)
+                self.url = url
+
+            def geturl(self) -> str:
+                return self.url
+
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        empty_shell = b"<html><title>Amazing AI Course</title><div id=app></div></html>"
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response("https://example.test/", empty_shell)) as request:
+            result = tools.execute("discover_url", {"url": "https://example.test/#/"})
+        self.assertIn("Title (metadata only): Amazing AI Course", result)
+        self.assertIn("no reliable content candidates found", result)
+        self.assertNotIn("README.md", result)
+        self.assertEqual(request.call_count, 1)
+
+        linked_shell = b"""<html><body>
+            <a href=\"/one.md\">one</a><a href=\"/one.md\">duplicate</a>
+            <a href=\"/two.md\">two</a><a href=\"javascript:alert(1)\">bad</a>
+            <a href=\"mailto:test@example.test\">mail</a><a href=\"https://other.test/out.md\">external</a>
+            </body></html>"""
+        calls: list[str] = []
+
+        def open_url(request, timeout=0):
+            calls.append(request.full_url)
+            if request.full_url == "https://example.test/":
+                return Response(request.full_url, linked_shell)
+            return Response(request.full_url, b"verified")
+
+        with patch("chattyplay.tools.urllib.request.urlopen", side_effect=open_url):
+            result = tools.execute("discover_url", {"url": "https://example.test/#/", "max_candidates": 1})
+        self.assertIn("https://example.test/one.md", result)
+        self.assertNotIn("two.md", result)
+        self.assertNotIn("other.test", result)
+        self.assertEqual(calls, ["https://example.test/", "https://example.test/one.md"])
+
+    def test_fetch_url_rejects_empty_shell_and_bad_content_type(self) -> None:
+        class Headers:
+            def __init__(self, content_type: str) -> None:
+                self.content_type = content_type
+
+            def get_content_type(self) -> str:
+                return self.content_type
+
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response(io.BytesIO):
+            status = 200
+            url = "https://example.test/page"
+
+            def __init__(self, body: bytes, content_type: str) -> None:
+                super().__init__(body)
+                self.headers = Headers(content_type)
+
+            def geturl(self) -> str:
+                return self.url
+
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response(b"<html><body>Enable JavaScript</body></html>", "text/html")):
+            result = tools.execute("fetch_url", {"url": "https://example.test/page"})
+        self.assertIn("unable to read this page reliably", result)
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response(b"binary", "application/octet-stream")):
+            result = tools.execute("fetch_url", {"url": "https://example.test/file"})
+        self.assertIn("unsupported Content-Type", result)
+
+    def test_fetch_url_retries_only_transient_failures(self) -> None:
+        class Headers:
+            def get_content_type(self) -> str:
+                return "text/plain"
+
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response(io.BytesIO):
+            headers = Headers()
+            status = 200
+            url = "https://example.test/ok"
+
+            def geturl(self) -> str:
+                return self.url
+
+        tools = ToolRegistry(self.root, {"browser": "allow"})
+        transient = urllib.error.HTTPError("https://example.test", 503, "temporary", {}, io.BytesIO())
+        with patch("chattyplay.tools.urllib.request.urlopen", side_effect=[transient, Response(b"eventually successful response")]) as request, patch("chattyplay.tools.time.sleep") as sleep:
+            result = tools.execute("fetch_url", {"url": "https://example.test"})
+        self.assertIn("eventually successful", result)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once()
+
+        missing = urllib.error.HTTPError("https://example.test/missing", 404, "missing", {}, io.BytesIO())
+        with patch("chattyplay.tools.urllib.request.urlopen", side_effect=missing) as request, patch("chattyplay.tools.time.sleep") as sleep:
+            result = tools.execute("fetch_url", {"url": "https://example.test/missing"})
+        self.assertIn("not retryable", result)
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+        with patch("chattyplay.tools.urllib.request.urlopen", side_effect=TimeoutError("slow")) as request, patch("chattyplay.tools.time.sleep"):
+            result = tools.execute("fetch_url", {"url": "https://example.test/slow"})
+        self.assertIn("after 2 attempts", result)
+        self.assertEqual(request.call_count, 2)
+
+    def test_fetch_url_falls_back_from_unknown_charset_and_keeps_size_limit(self) -> None:
+        class Headers:
+            def get_content_type(self) -> str:
+                return "text/plain"
+
+            def get_content_charset(self) -> str:
+                return "not-a-real-charset"
+
+        class Response(io.BytesIO):
+            headers = Headers()
+            status = 200
+            url = "https://example.test/text"
+
+            def geturl(self) -> str:
+                return self.url
+
+        tools = ToolRegistry(self.root, {"browser": "allow"}, max_output=2_000_000)
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response("fallback text".encode())):
+            self.assertIn("fallback text", tools.execute("fetch_url", {"url": "https://example.test/text"}))
+        with patch("chattyplay.tools.urllib.request.urlopen", return_value=Response(b"x" * 1_000_001)):
+            result = tools.execute("fetch_url", {"url": "https://example.test/large"})
+        self.assertIn("response truncated at 1 MB", result)
+
+    def test_base_prompt_requires_grounded_url_fetching(self) -> None:
+        self.assertIn("call fetch_url before answering", BASE_PROMPT)
+        self.assertIn("real URL target", BASE_PROMPT)
+        self.assertIn("call discover_url", BASE_PROMPT)
+        self.assertIn("never use it to guess page contents", BASE_PROMPT)
+        self.assertIn("could not be read reliably", BASE_PROMPT)
+
+    def test_move_file_schema_and_prompt_direct_rename_requests(self) -> None:
+        tools = ToolRegistry(self.root)
+        description = tools.tools["move_file"].description
+        self.assertIn("Rename or move an existing file", description)
+        self.assertIn("without reading or rebuilding its contents", description)
+        self.assertIn("call move_file directly", BASE_PROMPT)
+        self.assertIn("Do not read the file contents first", BASE_PROMPT)
+        self.assertIn("never simulate a failed move with create_file, write_file, edit_file, delete_file", BASE_PROMPT)
+        self.assertIn("Only report rename/move success when move_file returns `ok:`", BASE_PROMPT)
+        self.assertIn("do not overwrite: report the conflict", BASE_PROMPT)
+
     def test_streamed_tool_call_is_reassembled(self) -> None:
         events = [
             {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "write_", "arguments": "{\"path\":"}}]}}]},
@@ -269,10 +668,11 @@ class CoreTests(unittest.TestCase):
     def test_openai_reasoning_options_are_only_sent_when_enabled(self) -> None:
         response = io.BytesIO(b'{"choices":[{"message":{"role":"assistant","content":"ok"}}]}')
         response.headers = {"Content-Type": "application/json"}
-        provider = {"api_key_env": "", "model": "test", "base_url": "http://localhost/v1", "max_tokens": 10, "thinking_enabled": True, "reasoning_effort": "high"}
+        provider = {"api_key_env": "", "model": "test", "base_url": "http://localhost/v1", "max_tokens": 10, "thinking_enabled": True, "reasoning_effort": "high", "request_timeout": 12}
         with patch("chattyplay.client.urllib.request.urlopen", return_value=response) as request:
             OpenAIClient(provider).complete([], [])
         payload = json.loads(request.call_args.args[0].data)
+        self.assertEqual(request.call_args.kwargs["timeout"], 12)
         self.assertNotIn("thinking", payload)
         self.assertEqual(payload["stream_options"], {"include_usage": True})
         self.assertEqual(payload["reasoning_effort"], "high")
@@ -370,7 +770,6 @@ class CoreTests(unittest.TestCase):
         config["agent"]["max_context_chars"] = 1000
         agent = Agent(self.root, config)
         fake = FakeClient()
-        agent.client = fake
         try:
             agent.messages = [
                 {"role": "user", "content": "oldest " * 100},
@@ -378,12 +777,88 @@ class CoreTests(unittest.TestCase):
                 {"role": "user", "content": "recent question"},
                 {"role": "assistant", "content": "recent answer"},
             ]
-            self.assertTrue(agent._auto_compact())
+            with patch("chattyplay.agent.create_client", return_value=fake) as create:
+                self.assertTrue(agent._auto_compact())
             self.assertIn("oldest", fake.source)
+            compact_provider = create.call_args.args[0]
+            self.assertFalse(compact_provider["thinking_enabled"])
+            self.assertEqual(compact_provider["reasoning_effort"], "none")
+            self.assertLessEqual(compact_provider["max_tokens"], 1536)
+            self.assertEqual(compact_provider["request_timeout"], 30)
             self.assertEqual(agent.messages[-2]["content"], "recent question")
             self.assertEqual(agent.messages[-1]["content"], "recent answer")
             self.assertIn("old work summary", agent.messages[0]["content"])
             self.assertEqual(SessionStore(self.root).load(agent.session_id), agent.messages)
+            self.assertFalse(agent._auto_compact())
+            agent.messages.extend([{"role": "user", "content": "small follow-up"}, {"role": "assistant", "content": "small answer"}])
+            self.assertFalse(agent._auto_compact())
+        finally:
+            agent.close()
+
+    def test_auto_compact_bounds_large_tool_history_and_preserves_key_context(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.source = ""
+
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None, on_tool_delta=None) -> dict:
+                self.source = messages[-1]["content"]
+                return {"role": "assistant", "content": "bounded summary"}
+
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["agent"]["max_context_chars"] = 10000
+        config["provider"]["max_tokens"] = 8192
+        agent = Agent(self.root, config)
+        fake = FakeClient()
+        try:
+            agent.messages = [
+                {"role": "user", "content": "original user goal must survive"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "x", "function": {"name": "read_file", "arguments": "{\"path\":\"large.txt\"}"}}]},
+                {"role": "tool", "tool_call_id": "x", "content": "tool-start\n" + "x" * 50000 + "\ntool-end"},
+                {"role": "user", "content": "important old decision " + "d" * 6000},
+                {"role": "assistant", "content": "decision recorded"},
+                {"role": "user", "content": "recent active question"},
+                {"role": "assistant", "content": "recent active answer"},
+            ]
+            with patch("chattyplay.agent.create_client", return_value=fake):
+                self.assertTrue(agent._auto_compact())
+            self.assertIn("original user goal must survive", fake.source)
+            self.assertIn("important old decision", fake.source)
+            self.assertIn("tool-start", fake.source)
+            self.assertIn("tool-end", fake.source)
+            self.assertLess(len(fake.source), 5500)
+            self.assertEqual(agent.messages[-2]["content"], "recent active question")
+            self.assertEqual(agent.messages[-1]["content"], "recent active answer")
+            self.assertLess(len(json.dumps(agent.messages, ensure_ascii=False)), 5000)
+        finally:
+            agent.close()
+
+    def test_auto_compact_failure_waits_for_context_growth_before_retry(self) -> None:
+        class FailingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, messages: list[dict], tools: list[dict], on_text=None, on_tool_delta=None) -> dict:
+                self.calls += 1
+                raise RuntimeError("summary unavailable")
+
+        config = ConfigStore(self.root, self.root / "user.json").load()
+        config["agent"]["max_context_chars"] = 10000
+        agent = Agent(self.root, config)
+        failing = FailingClient()
+        try:
+            agent.messages = [
+                {"role": "user", "content": "old goal " + "x" * 10000},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": "recent"},
+                {"role": "assistant", "content": "answer"},
+            ]
+            with patch("chattyplay.agent.create_client", return_value=failing):
+                self.assertFalse(agent._auto_compact())
+                self.assertFalse(agent._auto_compact())
+                self.assertEqual(failing.calls, 1)
+                agent.messages.append({"role": "user", "content": "growth " + "y" * 2500})
+                self.assertFalse(agent._auto_compact())
+                self.assertEqual(failing.calls, 2)
         finally:
             agent.close()
 

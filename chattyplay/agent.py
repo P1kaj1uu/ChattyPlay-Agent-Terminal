@@ -21,7 +21,9 @@ BASE_PROMPT = """You are ChattyPlay, a local AI coding agent.
 Work directly in the current workspace and finish the user's task end to end.
 Inspect existing code before editing. Prefer small root-cause fixes and existing project patterns.
 For new files, use create_file with the path and concise implementation instructions, not write_file with the entire source. create_file creates the file first and streams its contents directly. Include all requirements and relevant context in its instructions. Use edit_file for changes to existing files.
+When the user only asks to rename or move an existing file and the source and destination are clear, call move_file directly. move_file is the only correct write operation for rename/move. Do not read the file contents first, and never simulate a failed move with create_file, write_file, edit_file, delete_file, or delete-and-create. Only report rename/move success when move_file returns `ok:`. If it reports a destination conflict, do not overwrite: report the conflict and ask for a different destination or explicit overwrite direction. For a missing source, use read-only listing/search only when the path may be unclear. Report permission, lock, cross-device, and other system errors accurately; case-only renames are handled by move_file itself.
 Use tools whenever facts depend on local files or commands. Never invent tool results.
+When a user provides an HTTP(S) URL or Markdown link and the answer depends on that page, extract the real URL target (not the whole `[label](url)` text) and call fetch_url before answering. Ground page-specific claims in fetched text, including the final URL after redirects. If fetch_url reports a JavaScript app shell or too little readable content, call discover_url, then fetch a verified content candidate before answering. A title, domain, URL path, or discovery result is only a lead: never use it to guess page contents, never treat a search snippet as the full page, and never invent paths such as README.md merely because a URL contains `#/`. If fetching and evidence-based discovery fail, say that the page could not be read reliably and do not fill gaps from memory.
 Keep edits inside the workspace. Run the smallest relevant verification after non-trivial edits.
 Do not perform destructive, irreversible, privileged, or externally visible actions without explicit user approval.
 When done, summarize the result and verification concisely.
@@ -36,6 +38,11 @@ ACTIVATE_TOOLS = {
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 }
+
+AUTO_COMPACT_TARGET_RATIO = 0.4
+AUTO_SUMMARY_MAX_INPUT_CHARS = 40000
+AUTO_SUMMARY_MAX_TOKENS = 1536
+AUTO_SUMMARY_TIMEOUT_SECONDS = 30
 
 
 def _tool_status(name: str, arguments: str) -> str:
@@ -146,6 +153,7 @@ class Agent:
             + (f"\n{skill_text}\n" if skill_text else "")
         )
         self.client = create_client(config["provider"])
+        self._auto_compact_failed_at_size: int | None = None
         self.plan_mode = False
         self._on_file = None
         self.registry.add(Tool(
@@ -337,6 +345,7 @@ class Agent:
             {"role": "user", "content": "Previous session summary:\n" + summary},
             {"role": "assistant", "content": "Understood. I will continue from this summary."},
         ]
+        self._auto_compact_failed_at_size = None
         self.turns.clear()
         self.sessions.save(self.session_id, self.messages)
         return f"ok: compacted conversation to {len(summary)} characters"
@@ -344,7 +353,11 @@ class Agent:
     def _auto_compact(self, on_status: Callable[[str], None] | None = None) -> bool:
         config = self.config.get("agent", {})
         limit = int(config.get("max_context_chars", 500000))
-        if not config.get("auto_compact", True) or len(json.dumps(self.messages, ensure_ascii=False)) < limit * float(config.get("auto_compact_ratio", 0.8)):
+        total_size = self._message_chars(self.messages)
+        if not config.get("auto_compact", True) or total_size < limit * float(config.get("auto_compact_ratio", 0.8)):
+            return False
+        retry_growth = max(2000, int(limit * 0.1))
+        if self._auto_compact_failed_at_size is not None and total_size < self._auto_compact_failed_at_size + retry_growth:
             return False
         turns: list[list[dict[str, Any]]] = []
         for message in self.messages:
@@ -356,9 +369,10 @@ class Agent:
                 turns[-1].append(message)
         recent: list[list[dict[str, Any]]] = []
         used = 0
+        target = max(1, int(limit * AUTO_COMPACT_TARGET_RATIO))
         for turn in reversed(turns):
             size = len(json.dumps(turn, ensure_ascii=False))
-            if recent and used + size > limit // 2:
+            if recent and used + size > target:
                 break
             recent.append(turn)
             used += size
@@ -368,25 +382,98 @@ class Agent:
         if on_status:
             on_status("compacting")
         try:
-            summary = self._summarize([message for turn in old for message in turn])
+            summary = self._summarize(
+                [message for turn in old for message in turn],
+                automatic=True,
+                source_limit=max(1000, min(limit // 2, AUTO_SUMMARY_MAX_INPUT_CHARS)),
+            )
         except Exception:
+            self._auto_compact_failed_at_size = total_size
             return False
         self.messages = [
             {"role": "user", "content": "Previous session summary:\n" + summary},
             {"role": "assistant", "content": "Understood. I will continue from this summary."},
             *[message for turn in reversed(recent) for message in turn],
         ]
+        self._auto_compact_failed_at_size = None
         self.turns.clear()
         self.sessions.save(self.session_id, self.messages)
         return True
 
-    def _summarize(self, messages: list[dict[str, Any]]) -> str:
-        source = json.dumps(messages, ensure_ascii=False)
+    @staticmethod
+    def _message_chars(messages: list[dict[str, Any]]) -> int:
+        return len(json.dumps(messages, ensure_ascii=False))
+
+    @staticmethod
+    def _bounded_summary_source(messages: list[dict[str, Any]], limit: int) -> str:
+        if not messages:
+            return "[]"
+        per_message = max(300, min(4000, limit // 4))
+        first_user = next((index for index, message in enumerate(messages) if message.get("role") == "user"), 0)
+        previous_summary = next((
+            index for index in range(len(messages) - 1, -1, -1)
+            if str(messages[index].get("content", "")).startswith("Previous session summary:")
+        ), None)
+        indexes: list[int] = [first_user]
+        if previous_summary is not None and previous_summary not in indexes:
+            indexes.append(previous_summary)
+        for index in range(len(messages) - 1, -1, -1):
+            if index not in indexes:
+                indexes.append(index)
+
+        chunks: dict[int, str] = {}
+        used = 0
+        for index in indexes:
+            message = deepcopy(messages[index])
+            message.pop("_usage", None)
+            message.pop("reasoning_content", None)
+            content = message.get("content")
+            content_limit = min(per_message, 1000) if message.get("role") == "tool" else per_message
+            if isinstance(content, str) and len(content) > content_limit:
+                tail = max(80, content_limit // 4)
+                message["content"] = content[: content_limit - tail] + "\n... [truncated] ...\n" + content[-tail:]
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                arguments = str(function.get("arguments", ""))
+                if len(arguments) > 1000:
+                    function["arguments"] = arguments[:800] + "... [truncated] ..." + arguments[-150:]
+            chunk = json.dumps(message, ensure_ascii=False)
+            if len(chunk) > per_message:
+                chunk = chunk[: per_message - 18] + "... [truncated]"
+            separator = 1 if chunks else 0
+            if used + separator + len(chunk) > limit:
+                continue
+            chunks[index] = chunk
+            used += separator + len(chunk)
+        return "\n".join(chunks[index] for index in sorted(chunks))[:limit]
+
+    def _summarize(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        automatic: bool = False,
+        source_limit: int | None = None,
+    ) -> str:
+        source = (
+            self._bounded_summary_source(messages, source_limit)
+            if automatic and source_limit is not None
+            else json.dumps(messages, ensure_ascii=False)
+        )
         prompt = (
             "Summarize this coding session for another agent. Preserve user requirements, decisions, "
             "files changed, commands/results, unresolved problems, and next steps. Be concise and factual.\n\n" + source
         )
-        response = self.client.complete(
+        client = self.client
+        if automatic:
+            provider = {
+                **self.config["provider"],
+                "thinking_enabled": False,
+                "reasoning_effort": "none",
+                "max_tokens": min(int(self.config["provider"].get("max_tokens", 8192)), AUTO_SUMMARY_MAX_TOKENS),
+                "request_timeout": AUTO_SUMMARY_TIMEOUT_SECONDS,
+            }
+            client = create_client(provider)
+        response = client.complete(
             [{"role": "system", "content": "You create loss-minimizing coding-session summaries."}, {"role": "user", "content": prompt}],
             [],
         )

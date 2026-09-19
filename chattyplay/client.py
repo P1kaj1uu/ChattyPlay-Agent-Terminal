@@ -57,7 +57,7 @@ class OpenAIClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            with urllib.request.urlopen(request, timeout=float(self.provider.get("request_timeout", 600))) as response:
                 if "text/event-stream" not in response.headers.get("Content-Type", ""):
                     data = json.loads(response.read().decode("utf-8"))
                     message = data.get("choices", [{}])[0].get("message", {})
@@ -167,7 +167,7 @@ class AnthropicClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            with urllib.request.urlopen(request, timeout=float(self.provider.get("request_timeout", 600))) as response:
                 if "text/event-stream" not in response.headers.get("Content-Type", ""):
                     return self._response(json.loads(response.read().decode("utf-8")), on_text)
                 return self._read_stream(response, on_text, on_tool_delta)
